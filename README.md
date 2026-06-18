@@ -76,6 +76,29 @@ Example — run with PyTorch (MPS on Mac, or CUDA on Linux/Windows):
 QWEN_TTS_RUNTIME=pytorch QWEN_TTS_MODEL=0.6B ./run.sh
 ```
 
+### Multi-engine manager (non-MLX runtimes)
+
+On any non-MLX runtime the server runs a **multi-engine manager** that keeps **at
+most one model in VRAM at a time** — built for GPUs shared with other workloads.
+
+- **Engines:** `qwen` (Qwen3-TTS) and `voxcpm` (VoxCPM2). Models load **lazily** on
+  first use; switching engines unloads the previous one; the resident model is
+  also **evicted after `QWEN_TTS_IDLE_EVICT_SECONDS`** of inactivity, returning
+  VRAM to the driver. `GET /health` reports the resident engine and live VRAM.
+- **Choosing an engine:** a voice is registered under an engine (`engine=` form
+  field on `POST /voices`, default `qwen`); requests route to that engine, or
+  override per-request with `"engine"` in the `/tts` body.
+- **VoxCPM voices & tone:** a VoxCPM voice is a reference clip (timbre) plus an
+  optional **tone seed** (`seed_audio` + `seed_text` on `POST /voices`). Every
+  generation continues that locked tone, so prosody stays consistent across a
+  long video instead of drifting per sentence. Output is 48 kHz.
+- **Requires Python <3.13** (VoxCPM constraint). The MLX path is unaffected.
+
+```bash
+# CUDA box: multi-engine (Qwen + VoxCPM), evict after 2 min idle
+QWEN_TTS_RUNTIME=pytorch QWEN_TTS_IDLE_EVICT_SECONDS=120 ./run.sh
+```
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -84,6 +107,11 @@ QWEN_TTS_RUNTIME=pytorch QWEN_TTS_MODEL=0.6B ./run.sh
 | `QWEN_TTS_MLX_MODEL` | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` | HuggingFace model ID for MLX |
 | `QWEN_TTS_MODEL` | `1.7B` | PyTorch model size: `1.7B` or `0.6B` |
 | `QWEN_TTS_TIMEOUT` | `600` | Per-request generation timeout in seconds |
+| `QWEN_TTS_IDLE_EVICT_SECONDS` | `120` | Manager path: evict the resident model after this many idle seconds |
+| `QWEN_TTS_DEFAULT_ENGINE` | `qwen` | Manager path: engine for voices/requests that don't specify one |
+| `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HuggingFace model ID for the VoxCPM engine |
+| `VOXCPM_CFG_VALUE` | `3.3` | VoxCPM guidance scale |
+| `VOXCPM_TIMESTEPS` | `10` | VoxCPM diffusion inference steps |
 
 ## API endpoints
 

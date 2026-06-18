@@ -28,15 +28,15 @@ info "Checking prerequisites…"
 arch=$(uname -m)
 echo "  Architecture: $arch"
 
-# Python 3.13+
+# Python 3.10–3.12 (the VoxCPM engine caps at <3.13; MLX/Qwen run on 3.12 too).
 if ! command -v python3 &>/dev/null; then
-    fail "python3 not found. Install Python 3.13+ first."
+    fail "python3 not found. Install Python 3.10–3.12 first."
 fi
 py_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 py_major=$(echo "$py_version" | cut -d. -f1)
 py_minor=$(echo "$py_version" | cut -d. -f2)
-if (( py_major < 3 || py_minor < 13 )); then
-    fail "Python 3.13+ required — detected $py_version."
+if (( py_major != 3 || py_minor < 10 || py_minor > 12 )); then
+    fail "Python 3.10–3.12 required (VoxCPM caps <3.13) — detected $py_version."
 fi
 echo "  Python: $py_version"
 

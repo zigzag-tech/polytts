@@ -2,3 +2,6 @@
 torch>=2.10.0
 torchaudio>=2.10.0
 qwen-tts>=0.1.1
+
+# VoxCPM engine (multi-engine manager path). Requires Python <3.13.
+voxcpm>=2.0.3

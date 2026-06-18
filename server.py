@@ -1,7 +1,13 @@
-"""Qwen3-TTS FastAPI server for Voxlert — dual MLX / PyTorch backend.
+"""Qwen3-TTS FastAPI server for Voxlert — dual MLX / manager backend.
 
 Voices are uploaded via POST /voices (content-hashed, deduplicated) and
 referenced by voice_id in the POST /tts endpoint.
+
+MLX path: a single persistent model with pre-computed voice embeddings and an
+incremental PCM streaming endpoint backed by a disk L2 cache.  Manager path
+(non-MLX): a multi-engine ModelManager (qwen + voxcpm) that keeps one model in
+VRAM at a time and evicts it after idle so a co-resident workload can reclaim
+the GPU.
 """
 
 import os
@@ -24,8 +30,15 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
+from engines import QwenEngine, VoxcpmEngine, ModelManager, pcm16
 
 RUNTIME = os.environ.get("QWEN_TTS_RUNTIME", "mlx").lower()
+
+# Non-MLX runtimes use the multi-engine manager (one model in VRAM at a time,
+# evicted on engine-switch and after idle so the shared GPU is freed).
+_MANAGER_PATH = RUNTIME != "mlx"
+IDLE_EVICT_SECONDS = int(os.environ.get("QWEN_TTS_IDLE_EVICT_SECONDS", "120"))
+DEFAULT_ENGINE = os.environ.get("QWEN_TTS_DEFAULT_ENGINE", "qwen")
 
 # Cap in-memory voice caches so that registering thousands of unique voices
 # cannot grow memory without bound.  Evicted voices remain on disk and are
@@ -48,7 +61,6 @@ app = FastAPI(title="Qwen3-TTS Server")
 model = None
 model_name = None
 voice_meta: OrderedDict[str, dict] = OrderedDict()           # MLX:     voice_id -> {ref_text}
-voice_prompt_cache: OrderedDict[str, list] = OrderedDict()    # PyTorch: voice_id -> VoiceClonePromptItem list
 
 # MLX voice prompt cache: voice_id -> {speaker_embed, ref_codes, ref_text, audio}
 # Pre-computed at registration time so that generation avoids redundant
@@ -56,6 +68,11 @@ voice_prompt_cache: OrderedDict[str, list] = OrderedDict()    # PyTorch: voice_i
 # The "audio" field is a minimal stub — the full waveform is not retained
 # because the monkey-patched methods ignore their input.
 _mlx_prompt_cache: OrderedDict[str, dict] = OrderedDict()
+
+# Manager path (non-MLX): the one-model-in-VRAM manager + a GPU-free registry of
+# voices (voice_id -> {engine, dir, meta}) scanned from disk at startup.
+manager: ModelManager | None = None
+voice_registry: "OrderedDict[str, dict]" = OrderedDict()
 
 # Single-thread executor — keeps all GPU work on ONE thread to respect
 # Metal thread affinity (MLX) and MPS requirements (PyTorch).
@@ -68,10 +85,16 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
 # cannot pile up unbounded on the single GPU thread.  Under cap: no behavior
 # change; over cap: honest 429 + Retry-After.  (Per-account fairness needs the
 # account threaded from the hub capability; this is the global guard.)
+#
+# On the manager path the high-level generate_voice_clone returns whole clips,
+# so /tts/stream streams at sentence granularity: synthesize each sentence and
+# emit its PCM as soon as it is ready -> first-audio latency is one sentence,
+# not the whole digest.
 # ---------------------------------------------------------------------------
 _MAX_INFLIGHT = max(1, int(os.environ.get("QWEN_TTS_MAX_INFLIGHT", "3")))
 _RETRY_AFTER_SECONDS = max(1, int(os.environ.get("QWEN_TTS_RETRY_AFTER", "2")))
 _inflight = 0  # single-threaded event loop -> a plain counter is race-free
+_SENTENCE_ENDERS = ".!?\n。！？"
 
 
 def _try_admit() -> bool:
@@ -87,6 +110,43 @@ def _release() -> None:
     global _inflight
     if _inflight > 0:
         _inflight -= 1
+
+
+def _split_sentences(text):
+    """Split into sentence chunks (ASCII + CJK enders + newline). No regex so
+    there are no unicode-escape pitfalls."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    out, buf = [], []
+    for ch in text:
+        buf.append(ch)
+        if ch in _SENTENCE_ENDERS:
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+    seg = "".join(buf).strip()
+    if seg:
+        out.append(seg)
+    return out or [text]
+
+
+_LANG_NAMES = {
+    "en": "English", "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "ru": "Russian",
+}
+
+
+def _lang_name(code):
+    """Base ISO code (what the phone sends) -> the model's expected language
+    name. Pass through an already-named value; default English for terminal
+    content (the model's own default is Chinese, wrong for code)."""
+    if not code:
+        return "English"
+    c = str(code).strip()
+    return _LANG_NAMES.get(c.lower(), c)
 
 # ---------------------------------------------------------------------------
 # MLX backend
@@ -116,8 +176,6 @@ def _trim_voice_caches() -> None:
     while len(voice_meta) > _MAX_VOICES_IN_MEMORY:
         oldest, _ = voice_meta.popitem(last=False)
         _mlx_prompt_cache.pop(oldest, None)
-    while len(voice_prompt_cache) > _MAX_VOICES_IN_MEMORY:
-        voice_prompt_cache.popitem(last=False)
 
 
 def _load_mlx():
@@ -391,113 +449,67 @@ def _generate_mlx_stream(text, voice_id, queue, loop):
 
 
 # ---------------------------------------------------------------------------
-# PyTorch backend
+# Manager path (non-MLX): GPU-free voice registry + one-model-in-VRAM manager
 # ---------------------------------------------------------------------------
-AVAILABLE_MODELS = {
-    "0.6B": "Qwen3-TTS-12Hz-0.6B-Base",
-    "1.7B": "Qwen3-TTS-12Hz-1.7B-Base",
-}
-DEFAULT_PT_MODEL = os.environ.get("QWEN_TTS_MODEL", "1.7B")
-
-
-def _load_pytorch():
-    global model, model_name
-    import torch
-    from qwen_tts import Qwen3TTSModel
-
-    if torch.cuda.is_available():
-        device_map = "cuda"
-        device_name = "cuda"
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device_map = "mps"
-        device_name = "mps"
-    else:
-        device_map = "cpu"
-        device_name = "cpu"
-
-    model_key = DEFAULT_PT_MODEL
-    if model_key not in AVAILABLE_MODELS:
-        print(f"Unknown model key '{model_key}', falling back to 1.7B")
-        model_key = "1.7B"
-    model_name = AVAILABLE_MODELS[model_key]
-    model_path = MODELS_DIR / model_name
-    if not model_path.exists():
-        raise RuntimeError(f"Model not found: {model_path}")
-    print(f"Loading {model_name} on {device_name} …")
-    model = Qwen3TTSModel.from_pretrained(
-        str(model_path),
-        device_map=device_map,
-        dtype=torch.float32,
-        attn_implementation="sdpa",
-    )
-    print("Model loaded.")
-
-
-def _load_voices_pytorch():
-    """Load previously-uploaded voices from disk (PyTorch backend)."""
+def _scan_voice_registry():
+    """Populate voice_registry from disk WITHOUT any GPU work (no model load)."""
+    voice_registry.clear()
     if not VOICES_DIR.exists():
         return
-    for voice_dir in sorted(VOICES_DIR.iterdir()):
-        if not voice_dir.is_dir():
+    for d in sorted(VOICES_DIR.iterdir()):
+        if not d.is_dir():
             continue
-        meta_path = voice_dir / "meta.json"
-        wav_path = voice_dir / "voice.wav"
+        meta_path, wav_path = d / "meta.json", d / "voice.wav"
         if not meta_path.exists() or not wav_path.exists():
             continue
-        voice_id = voice_dir.name
         try:
             meta = json.loads(meta_path.read_text())
-            prompt = model.create_voice_clone_prompt(
-                ref_audio=str(wav_path),
-                ref_text=meta["ref_text"],
-                x_vector_only_mode=bool(meta.get("x_vector_only_mode", False)),
-            )
-            voice_prompt_cache[voice_id] = prompt
-            print(f"  cached voice: {voice_id}")
         except Exception as e:
-            print(f"  WARNING: skipping voice {voice_id}: {e}")
-    _trim_voice_caches()
-    print(f"Loaded {len(voice_prompt_cache)} voices")
+            print(f"  skipping voice {d.name}: {e}")
+            continue
+        # Legacy voices (pre-engine field) are Qwen.
+        voice_registry[d.name] = {"engine": meta.get("engine", "qwen"), "dir": d, "meta": meta}
+    print(f"Registered {len(voice_registry)} voices (models load lazily)")
 
 
-def _register_voice_pytorch(voice_id: str, wav_path: str, ref_text: str, x_vector_only_mode: bool):
-    prompt = model.create_voice_clone_prompt(
-        ref_audio=wav_path,
-        ref_text=ref_text,
-        x_vector_only_mode=x_vector_only_mode,
-    )
-    voice_prompt_cache[voice_id] = prompt
-    voice_prompt_cache.move_to_end(voice_id)
-    _trim_voice_caches()
-
-
-def _generate_pytorch(text: str, language: str, voice_clone_prompt, gen_kwargs: dict) -> bytes:
-    wavs, sr = model.generate_voice_clone(
-        text=text,
-        language=language,
-        voice_clone_prompt=voice_clone_prompt,
-        **gen_kwargs,
-    )
-    buf = io.BytesIO()
-    sf.write(buf, wavs[0], sr, subtype="PCM_16", format="WAV")
-    return buf.getvalue()
+def _resolve_engine(req_engine, voice_id):
+    """(engine_name, registry_entry) for a request, or (None, None) if unknown."""
+    entry = voice_registry.get(voice_id)
+    if entry is None:
+        return None, None
+    return (req_engine or entry["engine"]), entry
 
 
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
-def startup():
+async def startup():
+    global manager
     if RUNTIME == "mlx":
         _load_mlx()
         _load_voices_mlx()
-    elif RUNTIME == "pytorch":
-        _load_pytorch()
-        _load_voices_pytorch()
-    else:
-        raise RuntimeError(
-            f"Unknown QWEN_TTS_RUNTIME: {RUNTIME!r} (use 'mlx' or 'pytorch')"
-        )
+        return
+
+    # Manager path (CUDA/MPS/CPU): models load lazily; one resident at a time;
+    # evicted on engine switch and after IDLE_EVICT_SECONDS of inactivity.
+    manager = ModelManager({"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine()},
+                           IDLE_EVICT_SECONDS)
+    _scan_voice_registry()
+
+    async def _idle_loop():
+        loop = asyncio.get_running_loop()
+        interval = max(5, IDLE_EVICT_SECONDS // 4)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await loop.run_in_executor(_gpu_executor, manager.maybe_evict)
+            except Exception as e:
+                print(f"[idle] {e}")
+
+    asyncio.create_task(_idle_loop())
+    print(f"Manager ready (engines={list(manager.engines)}, "
+          f"default={DEFAULT_ENGINE}, idle_evict={IDLE_EVICT_SECONDS}s)")
 
 
 def _hash_audio(data: bytes) -> str:
@@ -509,59 +521,79 @@ async def upload_voice(
     audio: UploadFile = File(...),
     ref_text: str = Form(...),
     x_vector_only_mode: bool = Form(False),
+    engine: str = Form(DEFAULT_ENGINE),
+    seed_audio: UploadFile | None = File(None),
+    seed_text: str | None = Form(None),
 ):
+    """Register a voice.
+
+    Qwen voices = reference clip (timbre). VoxCPM voices may additionally carry
+    a tone *seed* (``seed_audio`` + ``seed_text``) so every generation continues
+    that locked tone. ``engine``/``seed_*`` are ignored on the MLX path.
+    """
     audio_bytes = await audio.read()
     if not audio_bytes:
         raise HTTPException(400, "Empty audio file")
 
-    voice_id = _hash_audio(audio_bytes + b"|xvec") if x_vector_only_mode else _hash_audio(audio_bytes)
-
-    # Already registered in memory — return immediately
-    if RUNTIME == "mlx" and voice_id in _mlx_prompt_cache:
+    # ----- Legacy MLX path (unchanged) -----
+    if not _MANAGER_PATH:
+        voice_id = _hash_audio(audio_bytes + b"|xvec") if x_vector_only_mode else _hash_audio(audio_bytes)
+        if voice_id in _mlx_prompt_cache:
+            return {"voice_id": voice_id}
+        voice_dir = VOICES_DIR / voice_id
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        (voice_dir / "voice.wav").write_bytes(audio_bytes)
+        (voice_dir / "meta.json").write_text(json.dumps(
+            {"ref_text": ref_text, "x_vector_only_mode": x_vector_only_mode}))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _gpu_executor, _register_voice_mlx, voice_id, str(voice_dir / "voice.wav"), ref_text)
+        print(f"Registered voice {voice_id}")
         return {"voice_id": voice_id}
-    if RUNTIME == "pytorch" and voice_id in voice_prompt_cache:
-        return {"voice_id": voice_id}
 
-    # Persist to disk
+    # ----- Manager path -----
+    if engine not in ("qwen", "voxcpm"):
+        raise HTTPException(400, f"Unknown engine: {engine}")
+    seed_bytes = await seed_audio.read() if seed_audio is not None else b""
+
+    # Content-hash so identical (audio, engine, mode, seed) dedupes to one id.
+    h = audio_bytes + b"|" + engine.encode()
+    if x_vector_only_mode:
+        h += b"|xvec"
+    if seed_bytes:
+        h += b"|seed:" + hashlib.sha256(seed_bytes).digest()
+    if seed_text:
+        h += b"|st:" + seed_text.encode()
+    voice_id = _hash_audio(h)
+
     voice_dir = VOICES_DIR / voice_id
     voice_dir.mkdir(parents=True, exist_ok=True)
-    wav_path = voice_dir / "voice.wav"
-    wav_path.write_bytes(audio_bytes)
-    (voice_dir / "meta.json").write_text(json.dumps({
-        "ref_text": ref_text,
-        "x_vector_only_mode": x_vector_only_mode,
-    }))
+    (voice_dir / "voice.wav").write_bytes(audio_bytes)
+    meta = {"engine": engine, "ref_text": ref_text, "x_vector_only_mode": x_vector_only_mode}
+    if seed_bytes and seed_text:
+        (voice_dir / "seed.wav").write_bytes(seed_bytes)
+        meta["seed_text"] = seed_text
+    (voice_dir / "meta.json").write_text(json.dumps(meta))
 
-    # Register in memory (both backends need GPU work)
-    loop = asyncio.get_running_loop()
-    if RUNTIME == "mlx":
-        await loop.run_in_executor(
-            _gpu_executor,
-            _register_voice_mlx, voice_id, str(wav_path), ref_text,
-        )
-    else:
-        await loop.run_in_executor(
-            _gpu_executor,
-            _register_voice_pytorch, voice_id, str(wav_path), ref_text, x_vector_only_mode,
-        )
-
-    print(f"Registered voice {voice_id}")
+    # No GPU work here — voice artifacts are built lazily on first /tts when the
+    # owning engine is resident, so registration never forces a model load.
+    voice_registry[voice_id] = {"engine": engine, "dir": voice_dir, "meta": meta}
+    print(f"Registered {engine} voice {voice_id}")
     return {"voice_id": voice_id}
 
 
 @app.get("/voices")
 def list_voices():
-    if RUNTIME == "mlx":
-        ids = sorted(voice_meta.keys())
-    else:
-        ids = sorted(voice_prompt_cache.keys())
-    return {"voices": ids}
+    if not _MANAGER_PATH:
+        return {"voices": sorted(voice_meta.keys())}
+    return {"voices": sorted(voice_registry.keys())}
 
 
 class TTSRequest(BaseModel):
     text: str
     voice_id: str | None = None
     language: str | None = None
+    engine: str | None = None          # manager path: override the voice's engine
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
@@ -592,97 +624,163 @@ async def tts(req: TTSRequest):
     language = req.language or "Chinese"
     gen_kwargs = _generation_kwargs(req)
     non_streaming_mode = req.non_streaming_mode if req.non_streaming_mode is not None else False
-    cache_key = (
-        req.text,
-        req.voice_id,
-        language,
-        non_streaming_mode,
-        json.dumps(gen_kwargs, sort_keys=True),
-    )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return Response(content=cached, media_type="audio/wav")
-
     loop = asyncio.get_running_loop()
 
-    if RUNTIME == "mlx":
+    if not _MANAGER_PATH:
+        cache_key = (req.text, req.voice_id, language, non_streaming_mode,
+                     json.dumps(gen_kwargs, sort_keys=True))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(content=cached, media_type="audio/wav")
         if req.voice_id and req.voice_id not in _mlx_prompt_cache:
             raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
         try:
             wav_bytes = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _gpu_executor,
-                    _generate_mlx, req.text, req.voice_id,
-                ),
-                timeout=TTS_TIMEOUT,
-            )
+                loop.run_in_executor(_gpu_executor, _generate_mlx, req.text, req.voice_id),
+                timeout=TTS_TIMEOUT)
         except asyncio.TimeoutError:
             raise HTTPException(504, "TTS generation timed out")
-    else:
-        if not req.voice_id:
-            raise HTTPException(400, "voice_id is required for PyTorch backend")
-        if req.voice_id not in voice_prompt_cache:
-            raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
-        try:
-            wav_bytes = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _gpu_executor,
-                    _generate_pytorch,
-                    req.text,
-                    language,
-                    voice_prompt_cache[req.voice_id],
-                    {**gen_kwargs, "non_streaming_mode": non_streaming_mode},
-                ),
-                timeout=TTS_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(504, "TTS generation timed out")
+        cache.put(cache_key, wav_bytes)
+        return Response(content=wav_bytes, media_type="audio/wav")
 
+    # ----- Manager path -----
+    if not req.voice_id:
+        raise HTTPException(400, "voice_id is required")
+    engine_name, entry = _resolve_engine(req.engine, req.voice_id)
+    if entry is None:
+        raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
+
+    cache_key = (engine_name, req.text, req.voice_id, language, non_streaming_mode,
+                 json.dumps(gen_kwargs, sort_keys=True))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(content=cached, media_type="audio/wav")
+
+    def job():
+        eng = manager.ensure(engine_name)
+        audio, sr = eng.generate(
+            req.text, req.voice_id, entry["dir"], entry["meta"], language,
+            {**gen_kwargs, "non_streaming_mode": non_streaming_mode})
+        buf = io.BytesIO()
+        sf.write(buf, audio, sr, subtype="PCM_16", format="WAV")
+        return buf.getvalue()
+
+    try:
+        wav_bytes = await asyncio.wait_for(
+            loop.run_in_executor(_gpu_executor, job), timeout=TTS_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "TTS generation timed out")
     cache.put(cache_key, wav_bytes)
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
 @app.post("/tts/stream")
 async def tts_stream(req: TTSRequest):
-    """Stream raw PCM as the model produces it (MLX backend only).
+    """Stream raw PCM as the model produces it.
 
     Body: little-endian signed 16-bit mono PCM, chunked as generated.
     Headers advertise the format so the caller can wrap/transcode (e.g. to
     Opus).  No WAV header is emitted — the length is unknown mid-stream.
 
-    The generation runs on the single GPU executor thread; chunks flow out
-    through an asyncio queue.  First-audio latency ≈ model time-to-first-chunk
-    (tuned by QWEN_TTS_STREAM_INTERVAL), not the full clip duration.
+    MLX path: the generation runs on the single GPU executor thread; chunks
+    flow out through an asyncio queue.  First-audio latency ≈ model
+    time-to-first-chunk (tuned by QWEN_TTS_STREAM_INTERVAL), not the full clip
+    duration.  Identical (text, voice_id) requests are served from a disk L2
+    PCM cache, skipping the GPU entirely.
+
+    Manager path: sentence-chunked across engines; within a sentence, engines
+    with native streaming (VoxCPM) emit sub-sentence chunks for lower
+    first-audio latency.  Qwen emits one chunk per sentence.
     """
-    if RUNTIME != "mlx":
-        raise HTTPException(400, "Streaming is only implemented for the MLX runtime")
-    if req.voice_id and req.voice_id not in _mlx_prompt_cache:
-        raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
+    if not _MANAGER_PATH:
+        if req.voice_id and req.voice_id not in _mlx_prompt_cache:
+            raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
 
-    sr = int(getattr(model, "sample_rate", 24000))
-    base_headers = {
-        "X-Sample-Rate": str(sr),
-        "X-Audio-Format": "s16le",
-        "X-Channels": "1",
-        "Cache-Control": "no-store",
-    }
+        sr = int(getattr(model, "sample_rate", 24000))
+        base_headers = {
+            "X-Sample-Rate": str(sr),
+            "X-Audio-Format": "s16le",
+            "X-Channels": "1",
+            "Cache-Control": "no-store",
+        }
 
-    # L2 cache: identical (text, voice_id) ⇒ identical audio. Serve from disk and
-    # skip the GPU entirely (no admission slot needed — no synthesis runs).
-    cached = pcm_cache.get(req.text, req.voice_id)
-    if cached is not None:
-        cached_sr, cached_bytes = cached
+        # L2 cache: identical (text, voice_id) ⇒ identical audio. Serve from disk and
+        # skip the GPU entirely (no admission slot needed — no synthesis runs).
+        cached = pcm_cache.get(req.text, req.voice_id)
+        if cached is not None:
+            cached_sr, cached_bytes = cached
 
-        async def cached_body():
-            chunk = 32768
-            for i in range(0, len(cached_bytes), chunk):
-                yield cached_bytes[i:i + chunk]
+            async def cached_body():
+                chunk = 32768
+                for i in range(0, len(cached_bytes), chunk):
+                    yield cached_bytes[i:i + chunk]
+
+            return StreamingResponse(
+                cached_body(),
+                media_type="application/octet-stream",
+                headers={**base_headers, "X-Sample-Rate": str(cached_sr), "X-Cache": "hit"},
+            )
+
+        if not _try_admit():
+            raise HTTPException(
+                429, "TTS server busy",
+                headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+            )
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        # Kick off generation on the GPU thread; do NOT await — chunks arrive via
+        # the queue.  The future is intentionally not held: if the client
+        # disconnects, generation runs to completion and its chunks are dropped.
+        loop.run_in_executor(
+            _gpu_executor, _generate_mlx_stream, req.text, req.voice_id, queue, loop,
+        )
+
+        async def body():
+            chunks: list[bytes] = []
+            completed = False
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=TTS_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        print("[tts/stream] timed out waiting for audio")
+                        return
+                    if item is _STREAM_DONE:
+                        completed = True
+                        return
+                    if isinstance(item, Exception):
+                        # Mid-stream failure: end the response.  Bytes already sent
+                        # are valid PCM; the caller treats a short stream as a soft
+                        # failure.
+                        print(f"[tts/stream] generation error: {item}")
+                        return
+                    chunks.append(item)
+                    yield item
+            finally:
+                _release()
+                # Only cache a CLEANLY completed synthesis — never a partial stream
+                # (client disconnect / timeout / error), which would poison the cache
+                # with truncated audio.
+                if completed and chunks:
+                    try:
+                        pcm_cache.put(req.text, req.voice_id, sr, b"".join(chunks))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[pcm_cache] put failed: {e}")
 
         return StreamingResponse(
-            cached_body(),
+            body(),
             media_type="application/octet-stream",
-            headers={**base_headers, "X-Sample-Rate": str(cached_sr), "X-Cache": "hit"},
+            headers={**base_headers, "X-Cache": "miss"},
         )
+
+    # ----- Manager path -----
+    if not req.voice_id:
+        raise HTTPException(400, "voice_id is required")
+    engine_name, entry = _resolve_engine(req.engine, req.voice_id)
+    if entry is None:
+        raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
 
     if not _try_admit():
         raise HTTPException(
@@ -690,53 +788,77 @@ async def tts_stream(req: TTSRequest):
             headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
         )
 
+    try:
+        language = _lang_name(req.language)
+        gen_kwargs = _generation_kwargs(req)
+        non_streaming_mode = req.non_streaming_mode if req.non_streaming_mode is not None else False
+        sentences = _split_sentences(req.text)
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        # Make the engine resident first so the response sample-rate header is
+        # correct (cold start may load the model here).
+        eng = await loop.run_in_executor(_gpu_executor, manager.ensure, engine_name)
+        sample_rate = eng.sample_rate
+
+        def worker():
+            try:
+                e = manager.ensure(engine_name)
+                for sent in sentences:
+                    for chunk in e.stream(
+                        sent, req.voice_id, entry["dir"], entry["meta"], language,
+                        {**gen_kwargs, "non_streaming_mode": non_streaming_mode},
+                    ):
+                        pcm = pcm16(chunk)
+                        if pcm:
+                            loop.call_soon_threadsafe(queue.put_nowait, pcm)
+                loop.call_soon_threadsafe(queue.put_nowait, _STREAM_DONE)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+
+        loop.run_in_executor(_gpu_executor, worker)
+
+        async def body():
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=TTS_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        print("[tts/stream] timed out waiting for audio")
+                        return
+                    if item is _STREAM_DONE:
+                        return
+                    if isinstance(item, Exception):
+                        print(f"[tts/stream] generation error: {item}")
+                        return
+                    yield item
+            finally:
+                _release()
+
+        headers = {
+            "X-Sample-Rate": str(sample_rate),
+            "X-Audio-Format": "s16le",
+            "X-Channels": "1",
+            "X-Engine": engine_name,
+            "Cache-Control": "no-store",
+        }
+        return StreamingResponse(body(), media_type="application/octet-stream", headers=headers)
+    except Exception:
+        _release()
+        raise
+
+
+@app.post("/model/unload")
+async def model_unload():
+    """Gracefully evict the resident model from VRAM (and return freed heap to
+    the OS) without stopping the server. Lets a co-resident workload — e.g. the
+    local renderer — reclaim GPU+RAM; the model reloads lazily on the next /tts.
+    No-op on the MLX path (single persistent model)."""
+    if not _MANAGER_PATH or manager is None:
+        raise HTTPException(400, "unload requires the manager (non-MLX) runtime")
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-
-    # Kick off generation on the GPU thread; do NOT await — chunks arrive via
-    # the queue.  The future is intentionally not held: if the client
-    # disconnects, generation runs to completion and its chunks are dropped.
-    loop.run_in_executor(
-        _gpu_executor, _generate_mlx_stream, req.text, req.voice_id, queue, loop,
-    )
-
-    async def body():
-        chunks: list[bytes] = []
-        completed = False
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=TTS_TIMEOUT)
-                except asyncio.TimeoutError:
-                    print("[tts/stream] timed out waiting for audio")
-                    return
-                if item is _STREAM_DONE:
-                    completed = True
-                    return
-                if isinstance(item, Exception):
-                    # Mid-stream failure: end the response.  Bytes already sent
-                    # are valid PCM; the caller treats a short stream as a soft
-                    # failure.
-                    print(f"[tts/stream] generation error: {item}")
-                    return
-                chunks.append(item)
-                yield item
-        finally:
-            _release()
-            # Only cache a CLEANLY completed synthesis — never a partial stream
-            # (client disconnect / timeout / error), which would poison the cache
-            # with truncated audio.
-            if completed and chunks:
-                try:
-                    pcm_cache.put(req.text, req.voice_id, sr, b"".join(chunks))
-                except Exception as e:  # noqa: BLE001
-                    print(f"[pcm_cache] put failed: {e}")
-
-    return StreamingResponse(
-        body(),
-        media_type="application/octet-stream",
-        headers={**base_headers, "X-Cache": "miss"},
-    )
+    evicted = await loop.run_in_executor(_gpu_executor, manager.unload_now)
+    return {"unloaded": evicted, "manager": manager.status()}
 
 
 @app.get("/health")
@@ -749,7 +871,7 @@ def health():
         "max_inflight": _MAX_INFLIGHT,
     }
 
-    if RUNTIME == "mlx":
+    if not _MANAGER_PATH:
         import mlx.core as mx
         info["device"] = "apple-silicon-mlx"
         info["voices"] = sorted(voice_meta.keys())
@@ -763,11 +885,17 @@ def health():
         import torch
         if torch.cuda.is_available():
             info["device"] = "cuda"
+            info["vram_mb"] = {
+                "allocated": round(torch.cuda.memory_allocated() / 1e6),
+                "reserved": round(torch.cuda.memory_reserved() / 1e6),
+            }
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             info["device"] = "mps"
         else:
             info["device"] = "cpu"
-        info["voices"] = sorted(voice_prompt_cache.keys())
+        info["manager"] = manager.status() if manager else None
+        info["model"] = manager.resident if manager else None
+        info["voices"] = sorted(voice_registry.keys())
         info["wav_cache_entries"] = len(cache._store)
 
     return info
