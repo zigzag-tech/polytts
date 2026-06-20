@@ -1,0 +1,33 @@
+# System-wide systemd unit for the PolyTTS server.
+#
+# Use this (instead of the user-level unit in the README) on a headless GPU box
+# that must serve without an interactive login — it boots at startup and is
+# revived on crash. Runs the pytorch "manager" backend (one model in VRAM at a
+# time, idle-evicted), the multi-engine path that hosts both Qwen3-TTS and VoxCPM.
+#
+# Install:
+#   sudo cp deploy/polytts.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polytts
+#   journalctl -u polytts -f          # logs
+#
+# Edit User, WorkingDirectory, and the ExecStart path to match your checkout.
+
+[Unit]
+Description=PolyTTS Server (multi-engine: Qwen3-TTS + VoxCPM, pytorch manager backend)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/FULL/PATH/TO/polytts
+Environment=HOME=/home/ubuntu
+Environment=POLYTTS_RUNTIME=pytorch
+ExecStart=/bin/bash /FULL/PATH/TO/polytts/run.sh
+Restart=always
+RestartSec=5s
+# Give the lazy model load + CUDA init room before considering startup failed
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

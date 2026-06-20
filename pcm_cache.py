@@ -8,8 +8,8 @@ disk-backed and survives restarts, and it is shared across every client/device
 hitting this engine.
 
 Bounded by total bytes (LRU). A small JSON manifest persists the index. Disable
-with QWEN_TTS_PCM_CACHE=0; tune with QWEN_TTS_PCM_CACHE_MAX_BYTES and
-QWEN_TTS_PCM_CACHE_DIR.
+with POLYTTS_PCM_CACHE=0; tune with POLYTTS_PCM_CACHE_MAX_BYTES and
+POLYTTS_PCM_CACHE_DIR.
 """
 
 import hashlib
@@ -19,10 +19,10 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-_ENABLED = os.environ.get("QWEN_TTS_PCM_CACHE", "1") != "0"
-_MAX_BYTES = int(os.environ.get("QWEN_TTS_PCM_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
+_ENABLED = os.environ.get("POLYTTS_PCM_CACHE", "1") != "0"
+_MAX_BYTES = int(os.environ.get("POLYTTS_PCM_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
 _DIR = Path(os.environ.get(
-    "QWEN_TTS_PCM_CACHE_DIR", str(Path.home() / ".cache" / "qwen-tts-pcm")))
+    "POLYTTS_PCM_CACHE_DIR", str(Path.home() / ".cache" / "polytts-pcm")))
 
 _lock = threading.Lock()
 _index: "OrderedDict[str, dict]" = OrderedDict()  # key -> {"bytes": int, "sr": int}

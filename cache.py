@@ -2,14 +2,14 @@
 
 The CLI client maintains its own disk-based WAV cache, so this server-side
 cache is a secondary layer.  A small default (50 entries, ~12-25 MB for
-typical notification phrases) is sufficient; raise via QWEN_TTS_CACHE_MAX
+typical notification phrases) is sufficient; raise via POLYTTS_CACHE_MAX
 if the server handles many unique phrases without a client cache in front.
 """
 
 import os
 from collections import OrderedDict
 
-MAX_ENTRIES = int(os.environ.get("QWEN_TTS_CACHE_MAX", "50"))
+MAX_ENTRIES = int(os.environ.get("POLYTTS_CACHE_MAX", "50"))
 
 _store: OrderedDict[tuple, bytes] = OrderedDict()
 

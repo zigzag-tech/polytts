@@ -112,7 +112,7 @@ class QwenEngine(Engine):
         device = "cuda" if torch.cuda.is_available() else (
             "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
             else "cpu")
-        key = os.environ.get("QWEN_TTS_MODEL", "1.7B")
+        key = os.environ.get("POLYTTS_MODEL", "1.7B")
         if key not in self.AVAILABLE_MODELS:
             key = "1.7B"
         self.model_name = self.AVAILABLE_MODELS[key]

@@ -1,4 +1,4 @@
-"""Qwen3-TTS FastAPI server for Voxlert — dual MLX / manager backend.
+"""PolyTTS FastAPI server — multi-engine, dual MLX / manager backend.
 
 Voices are uploaded via POST /voices (content-hashed, deduplicated) and
 referenced by voice_id in the POST /tts endpoint.
@@ -32,30 +32,30 @@ import cache
 import pcm_cache
 from engines import QwenEngine, VoxcpmEngine, ModelManager, pcm16
 
-RUNTIME = os.environ.get("QWEN_TTS_RUNTIME", "mlx").lower()
+RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
 # Non-MLX runtimes use the multi-engine manager (one model in VRAM at a time,
 # evicted on engine-switch and after idle so the shared GPU is freed).
 _MANAGER_PATH = RUNTIME != "mlx"
-IDLE_EVICT_SECONDS = int(os.environ.get("QWEN_TTS_IDLE_EVICT_SECONDS", "120"))
-DEFAULT_ENGINE = os.environ.get("QWEN_TTS_DEFAULT_ENGINE", "qwen")
+IDLE_EVICT_SECONDS = int(os.environ.get("POLYTTS_IDLE_EVICT_SECONDS", "120"))
+DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
 
 # Cap in-memory voice caches so that registering thousands of unique voices
 # cannot grow memory without bound.  Evicted voices remain on disk and are
 # reloaded on next use.  Default 100 is generous for normal usage.
-_MAX_VOICES_IN_MEMORY = int(os.environ.get("QWEN_TTS_MAX_VOICES_MEM", "100"))
+_MAX_VOICES_IN_MEMORY = int(os.environ.get("POLYTTS_MAX_VOICES_MEM", "100"))
 VOICES_DIR = Path(os.environ.get(
-    "QWEN_TTS_VOICES_DIR",
+    "POLYTTS_VOICES_DIR",
     str(Path(__file__).resolve().parent / "voices"),
 ))
 MODELS_DIR = Path(__file__).resolve().parent / "models"
-PORT = int(os.environ.get("QWEN_TTS_PORT", "8100"))
-TTS_TIMEOUT = int(os.environ.get("QWEN_TTS_TIMEOUT_SECONDS", "600"))
+PORT = int(os.environ.get("POLYTTS_PORT", "8100"))
+TTS_TIMEOUT = int(os.environ.get("POLYTTS_TIMEOUT_SECONDS", "600"))
 # Audio seconds per streamed chunk.  Lower = faster first-audio, more overhead.
 # 0.5 s gives sub-second time-to-first-chunk while keeping per-chunk work small.
-STREAM_INTERVAL = float(os.environ.get("QWEN_TTS_STREAM_INTERVAL", "0.5"))
+STREAM_INTERVAL = float(os.environ.get("POLYTTS_STREAM_INTERVAL", "0.5"))
 
-app = FastAPI(title="Qwen3-TTS Server")
+app = FastAPI(title="PolyTTS Server")
 
 # Filled at startup
 model = None
@@ -91,8 +91,8 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
 # emit its PCM as soon as it is ready -> first-audio latency is one sentence,
 # not the whole digest.
 # ---------------------------------------------------------------------------
-_MAX_INFLIGHT = max(1, int(os.environ.get("QWEN_TTS_MAX_INFLIGHT", "3")))
-_RETRY_AFTER_SECONDS = max(1, int(os.environ.get("QWEN_TTS_RETRY_AFTER", "2")))
+_MAX_INFLIGHT = max(1, int(os.environ.get("POLYTTS_MAX_INFLIGHT", "3")))
+_RETRY_AFTER_SECONDS = max(1, int(os.environ.get("POLYTTS_RETRY_AFTER", "2")))
 _inflight = 0  # single-threaded event loop -> a plain counter is race-free
 _SENTENCE_ENDERS = ".!?\n。！？"
 
@@ -153,18 +153,18 @@ def _lang_name(code):
 # ---------------------------------------------------------------------------
 
 # Default: 1.7B-8bit for best voice quality (~2.9 GB: 2.25 GB backbone + 651 MB codec).
-# Override with QWEN_TTS_MLX_MODEL for lower memory at reduced quality:
+# Override with POLYTTS_MLX_MODEL for lower memory at reduced quality:
 #   0.6B-4bit: ~1.63 GB (mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit)
 #   0.6B-6bit: ~1.65 GB (mlx-community/Qwen3-TTS-12Hz-0.6B-Base-6bit)
 MLX_MODEL_ID = os.environ.get(
-    "QWEN_TTS_MLX_MODEL",
+    "POLYTTS_MLX_MODEL",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
 )
 
 # How much freed Metal memory the MLX allocator may hoard for reuse.
 # Lower = tighter steady-state footprint; higher = fewer re-allocations.
 # 0 disables the cache entirely.  Default: 256 MB.
-_MLX_CACHE_LIMIT = int(os.environ.get("QWEN_TTS_MLX_CACHE_MB", "256")) * 1024 * 1024
+_MLX_CACHE_LIMIT = int(os.environ.get("POLYTTS_MLX_CACHE_MB", "256")) * 1024 * 1024
 
 
 def _trim_voice_caches() -> None:
@@ -684,7 +684,7 @@ async def tts_stream(req: TTSRequest):
 
     MLX path: the generation runs on the single GPU executor thread; chunks
     flow out through an asyncio queue.  First-audio latency ≈ model
-    time-to-first-chunk (tuned by QWEN_TTS_STREAM_INTERVAL), not the full clip
+    time-to-first-chunk (tuned by POLYTTS_STREAM_INTERVAL), not the full clip
     duration.  Identical (text, voice_id) requests are served from a disk L2
     PCM cache, skipping the GPU entirely.
 

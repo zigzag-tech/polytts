@@ -6,9 +6,9 @@ cd "$SCRIPT_DIR"
 
 # Default: MLX on Apple Silicon, PyTorch elsewhere (CUDA/MPS/CPU)
 if [[ "$(uname -m)" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
-    export QWEN_TTS_RUNTIME=${QWEN_TTS_RUNTIME:-mlx}
+    export POLYTTS_RUNTIME=${POLYTTS_RUNTIME:-mlx}
 else
-    export QWEN_TTS_RUNTIME=${QWEN_TTS_RUNTIME:-pytorch}
+    export POLYTTS_RUNTIME=${POLYTTS_RUNTIME:-pytorch}
 fi
 
 resolve_python() {
@@ -33,16 +33,16 @@ resolve_python() {
 
 uv_bootstrap() {
     local uv_args=(run --with-requirements requirements-common.txt)
-    if [[ "$QWEN_TTS_RUNTIME" == "mlx" ]] && [[ "$(uname -m)" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$POLYTTS_RUNTIME" == "mlx" ]] && [[ "$(uname -m)" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
         uv_args+=(--with-requirements requirements-mlx.txt --prerelease=allow)
     else
         uv_args+=(--with-requirements requirements-pytorch.txt)
     fi
-    exec env QWEN_TTS_UV_BOOTSTRAPPED=1 uv "${uv_args[@]}" ./run.sh
+    exec env POLYTTS_UV_BOOTSTRAPPED=1 uv "${uv_args[@]}" ./run.sh
 }
 
 if ! PYTHON_BIN="$(resolve_python)"; then
-    if command -v uv >/dev/null 2>&1 && [[ "${QWEN_TTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
+    if command -v uv >/dev/null 2>&1 && [[ "${POLYTTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
         echo "==> No Python interpreter found. Bootstrapping with uv…"
         uv_bootstrap
     fi
@@ -52,7 +52,7 @@ if ! PYTHON_BIN="$(resolve_python)"; then
 fi
 
 if ! "$PYTHON_BIN" -c "import fastapi, soundfile" >/dev/null 2>&1; then
-    if command -v uv >/dev/null 2>&1 && [[ "${QWEN_TTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
+    if command -v uv >/dev/null 2>&1 && [[ "${POLYTTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
         echo "==> Python dependencies are missing for $PYTHON_BIN. Bootstrapping with uv…"
         uv_bootstrap
     fi
@@ -66,8 +66,8 @@ COOLDOWN=3
 restarts=0
 
 while true; do
-    echo "==> Starting Qwen3-TTS server (restart #$restarts)…"
-    QWEN_TTS_RUNTIME=${QWEN_TTS_RUNTIME:-mlx} "$PYTHON_BIN" server.py
+    echo "==> Starting PolyTTS server (restart #$restarts)…"
+    POLYTTS_RUNTIME=${POLYTTS_RUNTIME:-mlx} "$PYTHON_BIN" server.py
     exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then

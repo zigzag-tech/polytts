@@ -1,6 +1,6 @@
-# Qwen3-TTS (Voxlert TTS backend)
+# PolyTTS — multi-engine TTS server
 
-A FastAPI server that uses [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) for voice-cloned text-to-speech. Upload a short WAV reference plus transcript to create a `voice_id`, then synthesize speech with that voice.
+A FastAPI server for voice-cloned text-to-speech, **agnostic to the underlying TTS engine**. It currently ships two engines — [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) and [VoxCPM](https://huggingface.co/openbmb/VoxCPM2) — and is built so more can be added behind the same API. Upload a short WAV reference plus transcript to create a `voice_id`, then synthesize speech with that voice.
 
 ## Installation
 
@@ -16,11 +16,11 @@ A FastAPI server that uses [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12H
 
 ### Quick start
 
-The TTS server is a Python application that lives inside the Voxlert repository. If you installed Voxlert via `npm` or `npx`, you need to clone the repo first to get the server code:
+PolyTTS is a standalone Python server. It is also vendored into Voxlert as a git submodule at `cli/polytts`, but you can clone and run it on its own:
 
 ```bash
-git clone https://github.com/settinghead/voxlert.git
-cd voxlert/cli/qwen3-tts-server
+git clone https://github.com/zigzag-tech/polytts.git
+cd polytts
 ```
 
 **macOS / Linux:** Run the setup script, then start the server:
@@ -39,7 +39,7 @@ uv run ./run.sh
 voxlert config set tts_backend qwen
 ```
 
-**Windows:** The scripts above are bash (e.g. `setup.sh`, `run.sh`). Use **WSL** or **Git Bash** to run them, or do the steps manually: create a venv, `pip install -r requirements.txt`, download the PyTorch models (see Troubleshooting → "Model not found"), then run `python server.py` with `QWEN_TTS_RUNTIME=pytorch` from `qwen3-tts-server`.
+**Windows:** The scripts above are bash (e.g. `setup.sh`, `run.sh`). Use **WSL** or **Git Bash** to run them, or do the steps manually: create a venv, `pip install -r requirements.txt`, download the PyTorch models (see Troubleshooting → "Model not found"), then run `python server.py` with `POLYTTS_RUNTIME=pytorch` from `polytts`.
 
 Generate speech directly:
 
@@ -62,9 +62,9 @@ curl -X POST http://localhost:8100/tts \
 
 | Backend | Best for | Runtime flag | Models |
 |---------|----------|--------------|--------|
-| **MLX** | Apple Silicon Macs (quantized, fast) | `QWEN_TTS_RUNTIME=mlx` (default on Mac) | Different 8-bit model; **downloaded automatically** when the server starts with MLX |
-| **PyTorch + MPS** | Apple Silicon Macs (full precision) | `QWEN_TTS_RUNTIME=pytorch` on macOS | Same as CUDA — see below |
-| **PyTorch + CUDA** | Linux/Windows with NVIDIA GPU | `QWEN_TTS_RUNTIME=pytorch` when CUDA is available | **Same** HuggingFace models as MPS; `./setup.sh` downloads them |
+| **MLX** | Apple Silicon Macs (quantized, fast) | `POLYTTS_RUNTIME=mlx` (default on Mac) | Different 8-bit model; **downloaded automatically** when the server starts with MLX |
+| **PyTorch + MPS** | Apple Silicon Macs (full precision) | `POLYTTS_RUNTIME=pytorch` on macOS | Same as CUDA — see below |
+| **PyTorch + CUDA** | Linux/Windows with NVIDIA GPU | `POLYTTS_RUNTIME=pytorch` when CUDA is available | **Same** HuggingFace models as MPS; `./setup.sh` downloads them |
 
 **PyTorch (MPS and CUDA)** use the same model checkpoints (`Qwen/Qwen3-TTS-12Hz-1.7B-Base` and optionally `0.6B`). No separate download for CUDA — run `./setup.sh` once; it downloads the PyTorch models and works on both Apple (MPS) and Linux/Windows (CUDA). **MLX** uses a different, quantized model and fetches it on first run.
 
@@ -73,7 +73,7 @@ The server chooses PyTorch device automatically: CUDA if available, else MPS (Ap
 Example — run with PyTorch (MPS on Mac, or CUDA on Linux/Windows):
 
 ```bash
-QWEN_TTS_RUNTIME=pytorch QWEN_TTS_MODEL=0.6B ./run.sh
+POLYTTS_RUNTIME=pytorch POLYTTS_MODEL=0.6B ./run.sh
 ```
 
 ### Multi-engine manager (non-MLX runtimes)
@@ -83,7 +83,7 @@ most one model in VRAM at a time** — built for GPUs shared with other workload
 
 - **Engines:** `qwen` (Qwen3-TTS) and `voxcpm` (VoxCPM2). Models load **lazily** on
   first use; switching engines unloads the previous one; the resident model is
-  also **evicted after `QWEN_TTS_IDLE_EVICT_SECONDS`** of inactivity, returning
+  also **evicted after `POLYTTS_IDLE_EVICT_SECONDS`** of inactivity, returning
   VRAM to the driver. `GET /health` reports the resident engine and live VRAM.
 - **Choosing an engine:** a voice is registered under an engine (`engine=` form
   field on `POST /voices`, default `qwen`); requests route to that engine, or
@@ -96,19 +96,19 @@ most one model in VRAM at a time** — built for GPUs shared with other workload
 
 ```bash
 # CUDA box: multi-engine (Qwen + VoxCPM), evict after 2 min idle
-QWEN_TTS_RUNTIME=pytorch QWEN_TTS_IDLE_EVICT_SECONDS=120 ./run.sh
+POLYTTS_RUNTIME=pytorch POLYTTS_IDLE_EVICT_SECONDS=120 ./run.sh
 ```
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `QWEN_TTS_RUNTIME` | `mlx` | Backend: `mlx` or `pytorch` |
-| `QWEN_TTS_MLX_MODEL` | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` | HuggingFace model ID for MLX |
-| `QWEN_TTS_MODEL` | `1.7B` | PyTorch model size: `1.7B` or `0.6B` |
-| `QWEN_TTS_TIMEOUT` | `600` | Per-request generation timeout in seconds |
-| `QWEN_TTS_IDLE_EVICT_SECONDS` | `120` | Manager path: evict the resident model after this many idle seconds |
-| `QWEN_TTS_DEFAULT_ENGINE` | `qwen` | Manager path: engine for voices/requests that don't specify one |
+| `POLYTTS_RUNTIME` | `mlx` | Backend: `mlx` or `pytorch` |
+| `POLYTTS_MLX_MODEL` | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` | HuggingFace model ID for MLX |
+| `POLYTTS_MODEL` | `1.7B` | PyTorch model size: `1.7B` or `0.6B` |
+| `POLYTTS_TIMEOUT` | `600` | Per-request generation timeout in seconds |
+| `POLYTTS_IDLE_EVICT_SECONDS` | `120` | Manager path: evict the resident model after this many idle seconds |
+| `POLYTTS_DEFAULT_ENGINE` | `qwen` | Manager path: engine for voices/requests that don't specify one |
 | `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HuggingFace model ID for the VoxCPM engine |
 | `VOXCPM_CFG_VALUE` | `3.3` | VoxCPM guidance scale |
 | `VOXCPM_TIMESTEPS` | `10` | VoxCPM diffusion inference steps |
@@ -163,7 +163,7 @@ Generate speech from text using a registered `voice_id`.
 
 **Response:** `audio/wav` (PCM 16-bit)
 
-**Errors:** `404` if `voice_id` is not found, `504` if generation exceeds `QWEN_TTS_TIMEOUT_SECONDS` (default 600 s).
+**Errors:** `404` if `voice_id` is not found, `504` if generation exceeds `POLYTTS_TIMEOUT_SECONDS` (default 600 s).
 
 ```bash
 curl -X POST http://localhost:8100/tts \
@@ -207,7 +207,7 @@ curl http://localhost:8100/health | python3 -m json.tool
 
 ## Voices
 
-Uploaded voices live in `qwen3-tts-server/voices/`. Each voice directory contains:
+Uploaded voices live in `polytts/voices/`. Each voice directory contains:
 
 - **`meta.json`** — metadata including `ref_text` and `x_vector_only_mode`
 - **`voice.wav`** — a short reference audio clip of the target voice
@@ -219,7 +219,7 @@ both `voice.wav` and a non-empty `ref_text` in `meta.json` are loaded.
 
 ### macOS (LaunchAgent)
 
-Create `~/Library/LaunchAgents/com.voxlert.qwen-tts.plist`:
+Create `~/Library/LaunchAgents/com.voxlert.polytts.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -228,18 +228,18 @@ Create `~/Library/LaunchAgents/com.voxlert.qwen-tts.plist`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.voxlert.qwen-tts</string>
+    <string>com.voxlert.polytts</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/FULL/PATH/TO/cli/qwen3-tts-server/run.sh</string>
+        <string>/FULL/PATH/TO/cli/polytts/run.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/YOU/Library/Logs/qwen-tts.log</string>
+    <string>/Users/YOU/Library/Logs/polytts.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOU/Library/Logs/qwen-tts.log</string>
+    <string>/Users/YOU/Library/Logs/polytts.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -253,32 +253,32 @@ Replace `/FULL/PATH/TO/` and `/Users/YOU/` with real paths. Then load it:
 
 ```bash
 # Load (starts immediately and on every future login)
-launchctl load ~/Library/LaunchAgents/com.voxlert.qwen-tts.plist
+launchctl load ~/Library/LaunchAgents/com.voxlert.polytts.plist
 
 # Unload
-launchctl unload ~/Library/LaunchAgents/com.voxlert.qwen-tts.plist
+launchctl unload ~/Library/LaunchAgents/com.voxlert.polytts.plist
 
 # Check status
-launchctl list | grep qwen-tts
+launchctl list | grep polytts
 
 # View logs
-tail -f ~/Library/Logs/qwen-tts.log
+tail -f ~/Library/Logs/polytts.log
 ```
 
 **Note:** `run.sh` already restarts the server up to 10 times on crash, so the plist does not set `KeepAlive`. If the script itself exits (crash budget exhausted or clean shutdown), launchd will not re-launch it. To also let launchd restart the script after budget exhaustion, add `<key>KeepAlive</key><true/>` to the plist.
 
 ### Linux (systemd user service)
 
-Create `~/.config/systemd/user/qwen-tts.service`:
+Create `~/.config/systemd/user/polytts.service`:
 
 ```ini
 [Unit]
-Description=Qwen3-TTS server (Voxlert)
+Description=PolyTTS server (Voxlert)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash /FULL/PATH/TO/cli/qwen3-tts-server/run.sh
+ExecStart=/bin/bash /FULL/PATH/TO/cli/polytts/run.sh
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=10
@@ -292,19 +292,34 @@ Replace `/FULL/PATH/TO/` with the real path. Then enable it:
 ```bash
 # Reload, enable (auto-start on login), and start now
 systemctl --user daemon-reload
-systemctl --user enable --now qwen-tts
+systemctl --user enable --now polytts
 
 # Check status
-systemctl --user status qwen-tts
+systemctl --user status polytts
 
 # View logs
-journalctl --user -u qwen-tts -f
+journalctl --user -u polytts -f
 
 # Stop / disable
-systemctl --user disable --now qwen-tts
+systemctl --user disable --now polytts
 ```
 
 **Note:** For the service to run without an active login session, enable lingering: `loginctl enable-linger $USER`.
+
+### Linux (systemd system service)
+
+For a headless GPU box that must serve without any login (e.g. a shared CUDA
+host running the pytorch/manager backend), use the system-wide unit shipped at
+[`deploy/polytts.service`](deploy/polytts.service) instead of
+the user unit above. Edit its `User`, `WorkingDirectory`, and `ExecStart` path,
+then:
+
+```bash
+sudo cp deploy/polytts.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polytts   # boots on startup, Restart=always
+journalctl -u polytts -f
+```
 
 
 ## Troubleshooting

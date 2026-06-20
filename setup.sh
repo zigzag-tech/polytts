@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# First-time setup for the Qwen3-TTS experiment server.
+# First-time setup for the PolyTTS server.
 # Creates a venv, installs dependencies, and downloads models.
 #
 # PyTorch (MPS on Mac, CUDA on Linux/Windows): uses the same HuggingFace
@@ -127,10 +127,10 @@ if [[ "$arch" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
     echo "    ${bold}./run.sh${reset}"
     echo ""
     echo "  Or use the PyTorch backend (MPS):"
-    echo "    ${bold}QWEN_TTS_RUNTIME=pytorch ./run.sh${reset}"
+    echo "    ${bold}POLYTTS_RUNTIME=pytorch ./run.sh${reset}"
 else
     echo "  Start the server (PyTorch backend; uses CUDA if available):"
-    echo "    ${bold}QWEN_TTS_RUNTIME=pytorch ./run.sh${reset}"
+    echo "    ${bold}POLYTTS_RUNTIME=pytorch ./run.sh${reset}"
 fi
 echo ""
 echo "  Test it:"
