@@ -55,6 +55,15 @@ TTS_TIMEOUT = int(os.environ.get("POLYTTS_TIMEOUT_SECONDS", "600"))
 # 0.5 s gives sub-second time-to-first-chunk while keeping per-chunk work small.
 STREAM_INTERVAL = float(os.environ.get("POLYTTS_STREAM_INTERVAL", "0.5"))
 
+# MLX voxcpm engine (optional second model on the MLX runtime). When voices
+# registered under engine="voxcpm" are present, the MLX path lazily loads this
+# model and serves them alongside qwen. Voice ids are hashed exactly like the
+# manager path, so a voxcpm voice has the SAME voice_id on the mac (MLX) and the
+# CUDA nodes — the caller can hit either without re-registering.
+MLX_VOXCPM_MODEL_ID = os.environ.get("POLYTTS_MLX_VOXCPM_MODEL", "mlx-community/VoxCPM2-8bit")
+MLX_VOXCPM_CFG = float(os.environ.get("POLYTTS_MLX_VOXCPM_CFG", "2.0"))
+MLX_VOXCPM_STEPS = int(os.environ.get("POLYTTS_MLX_VOXCPM_STEPS", "10"))
+
 app = FastAPI(title="PolyTTS Server")
 
 # Filled at startup
@@ -73,6 +82,13 @@ _mlx_prompt_cache: OrderedDict[str, dict] = OrderedDict()
 # voices (voice_id -> {engine, dir, meta}) scanned from disk at startup.
 manager: ModelManager | None = None
 voice_registry: "OrderedDict[str, dict]" = OrderedDict()
+
+# MLX runtime, voxcpm engine: a lazily-loaded second model + a GPU-free registry
+# of voxcpm voices (voice_id -> {dir, ref_text, meta}). The model loads on the
+# first voxcpm request (or at startup if such voices exist) and stays resident —
+# the MLX path never evicts, so there is no per-request cold start.
+_voxcpm_mlx = None
+_mlx_voxcpm_voices: "OrderedDict[str, dict]" = OrderedDict()
 
 # Single-thread executor — keeps all GPU work on ONE thread to respect
 # Metal thread affinity (MLX) and MPS requirements (PyTorch).
@@ -312,6 +328,14 @@ def _load_voices_mlx():
             meta = json.loads(meta_path.read_text())
             ref_text = meta["ref_text"]
 
+            # voxcpm voices are served by the MLX voxcpm model, not the qwen
+            # speaker-embedding cache — register and skip the qwen precompute.
+            if meta.get("engine") == "voxcpm":
+                _mlx_voxcpm_voices[voice_id] = {
+                    "dir": voice_dir, "ref_text": ref_text, "meta": meta}
+                print(f"  registered voxcpm voice: {voice_id}")
+                continue
+
             # Try cached embeddings first (fast path — no model inference)
             prompt = _load_voice_cache_mlx(voice_dir, ref_text)
             if prompt is None:
@@ -449,6 +473,78 @@ def _generate_mlx_stream(text, voice_id, queue, loop):
 
 
 # ---------------------------------------------------------------------------
+# MLX voxcpm engine (second model on the MLX runtime)
+# ---------------------------------------------------------------------------
+def _load_voxcpm_mlx():
+    """Lazily load the MLX voxcpm model. Must run on the GPU executor thread."""
+    global _voxcpm_mlx
+    if _voxcpm_mlx is None:
+        from mlx_audio.tts.utils import load_model
+        print(f"Loading MLX voxcpm model {MLX_VOXCPM_MODEL_ID} …", flush=True)
+        _voxcpm_mlx = load_model(MLX_VOXCPM_MODEL_ID)
+        print(f"MLX voxcpm loaded. sr={getattr(_voxcpm_mlx, 'sample_rate', '?')}", flush=True)
+    return _voxcpm_mlx
+
+
+def _voxcpm_mlx_sr() -> int:
+    """Output sample rate for the voxcpm header. VoxCPM2 is 48 kHz; falls back to
+    that until the model is resident (the audio is 48 kHz regardless)."""
+    return int(getattr(_voxcpm_mlx, "sample_rate", 48000)) if _voxcpm_mlx is not None else 48000
+
+
+def _voxcpm_mlx_kwargs(voice: dict) -> dict:
+    return dict(
+        ref_audio=str(voice["dir"] / "voice.wav"),
+        ref_text=voice["ref_text"],
+        inference_timesteps=MLX_VOXCPM_STEPS,
+        cfg_value=MLX_VOXCPM_CFG,
+    )
+
+
+def _generate_voxcpm_mlx(text: str, voice: dict) -> bytes:
+    """One complete WAV from the MLX voxcpm model (GPU executor thread)."""
+    import mlx.core as mx
+
+    m = _load_voxcpm_mlx()
+    chunks, sample_rate = [], None
+    for result in m.generate(text=text, **_voxcpm_mlx_kwargs(voice)):
+        chunks.append(np.array(result.audio))
+        if sample_rate is None:
+            sample_rate = result.sample_rate
+    audio = np.concatenate(chunks)
+    del chunks
+    mx.clear_cache()
+    gc.collect()
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
+
+
+def _generate_voxcpm_mlx_stream(text, voice, queue, loop):
+    """Push s16le PCM from the MLX voxcpm model onto `queue` (GPU thread).
+
+    VoxCPM2 decodes a clip per generate() call (one yield), so /tts/stream emits
+    it at sentence granularity — same shape as the manager path, but with the
+    model resident (no cold start)."""
+    import mlx.core as mx
+
+    def push(item):
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    try:
+        m = _load_voxcpm_mlx()
+        for result in m.generate(text=text, **_voxcpm_mlx_kwargs(voice)):
+            pcm = _float_to_pcm16(result.audio)
+            if pcm:
+                push(pcm)
+        mx.clear_cache()
+        gc.collect()
+        push(_STREAM_DONE)
+    except Exception as exc:
+        push(exc)
+
+
+# ---------------------------------------------------------------------------
 # Manager path (non-MLX): GPU-free voice registry + one-model-in-VRAM manager
 # ---------------------------------------------------------------------------
 def _scan_voice_registry():
@@ -489,6 +585,13 @@ async def startup():
     if RUNTIME == "mlx":
         _load_mlx()
         _load_voices_mlx()
+        # Pre-load the voxcpm model when voxcpm voices exist so the first
+        # request isn't slow. Never fail startup if it can't load.
+        if _mlx_voxcpm_voices:
+            try:
+                _load_voxcpm_mlx()
+            except Exception as e:
+                print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
         return
 
     # Manager path (CUDA/MPS/CPU): models load lazily; one resident at a time;
@@ -537,6 +640,33 @@ async def upload_voice(
 
     # ----- Legacy MLX path (unchanged) -----
     if not _MANAGER_PATH:
+        # voxcpm on the MLX runtime: hash the voice id EXACTLY like the manager
+        # path so the same reference produces the same voice_id on every node.
+        if engine == "voxcpm":
+            seed_bytes = await seed_audio.read() if seed_audio is not None else b""
+            h = audio_bytes + b"|" + engine.encode()
+            if x_vector_only_mode:
+                h += b"|xvec"
+            if seed_bytes:
+                h += b"|seed:" + hashlib.sha256(seed_bytes).digest()
+            if seed_text:
+                h += b"|st:" + seed_text.encode()
+            voice_id = _hash_audio(h)
+            if voice_id in _mlx_voxcpm_voices:
+                return {"voice_id": voice_id}
+            voice_dir = VOICES_DIR / voice_id
+            voice_dir.mkdir(parents=True, exist_ok=True)
+            (voice_dir / "voice.wav").write_bytes(audio_bytes)
+            meta = {"engine": engine, "ref_text": ref_text, "x_vector_only_mode": x_vector_only_mode}
+            if seed_bytes and seed_text:
+                (voice_dir / "seed.wav").write_bytes(seed_bytes)
+                meta["seed_text"] = seed_text
+            (voice_dir / "meta.json").write_text(json.dumps(meta))
+            _mlx_voxcpm_voices[voice_id] = {
+                "dir": voice_dir, "ref_text": ref_text, "meta": meta}
+            print(f"Registered voxcpm voice {voice_id} (mlx)")
+            return {"voice_id": voice_id}
+
         voice_id = _hash_audio(audio_bytes + b"|xvec") if x_vector_only_mode else _hash_audio(audio_bytes)
         if voice_id in _mlx_prompt_cache:
             return {"voice_id": voice_id}
@@ -585,7 +715,7 @@ async def upload_voice(
 @app.get("/voices")
 def list_voices():
     if not _MANAGER_PATH:
-        return {"voices": sorted(voice_meta.keys())}
+        return {"voices": sorted(set(voice_meta.keys()) | set(_mlx_voxcpm_voices.keys()))}
     return {"voices": sorted(voice_registry.keys())}
 
 
@@ -627,6 +757,22 @@ async def tts(req: TTSRequest):
     loop = asyncio.get_running_loop()
 
     if not _MANAGER_PATH:
+        # voxcpm voice → MLX voxcpm model (its own cache namespace + 48 kHz).
+        vox = _mlx_voxcpm_voices.get(req.voice_id) if req.voice_id else None
+        if vox is not None:
+            vox_key = ("voxcpm", req.text, req.voice_id, language)
+            cached = cache.get(vox_key)
+            if cached is not None:
+                return Response(content=cached, media_type="audio/wav")
+            try:
+                wav_bytes = await asyncio.wait_for(
+                    loop.run_in_executor(_gpu_executor, _generate_voxcpm_mlx, req.text, vox),
+                    timeout=TTS_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise HTTPException(504, "TTS generation timed out")
+            cache.put(vox_key, wav_bytes)
+            return Response(content=wav_bytes, media_type="audio/wav")
+
         cache_key = (req.text, req.voice_id, language, non_streaming_mode,
                      json.dumps(gen_kwargs, sort_keys=True))
         cached = cache.get(cache_key)
@@ -693,10 +839,11 @@ async def tts_stream(req: TTSRequest):
     first-audio latency.  Qwen emits one chunk per sentence.
     """
     if not _MANAGER_PATH:
-        if req.voice_id and req.voice_id not in _mlx_prompt_cache:
+        vox = _mlx_voxcpm_voices.get(req.voice_id) if req.voice_id else None
+        if req.voice_id and vox is None and req.voice_id not in _mlx_prompt_cache:
             raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
 
-        sr = int(getattr(model, "sample_rate", 24000))
+        sr = _voxcpm_mlx_sr() if vox is not None else int(getattr(model, "sample_rate", 24000))
         base_headers = {
             "X-Sample-Rate": str(sr),
             "X-Audio-Format": "s16le",
@@ -733,9 +880,14 @@ async def tts_stream(req: TTSRequest):
         # Kick off generation on the GPU thread; do NOT await — chunks arrive via
         # the queue.  The future is intentionally not held: if the client
         # disconnects, generation runs to completion and its chunks are dropped.
-        loop.run_in_executor(
-            _gpu_executor, _generate_mlx_stream, req.text, req.voice_id, queue, loop,
-        )
+        if vox is not None:
+            loop.run_in_executor(
+                _gpu_executor, _generate_voxcpm_mlx_stream, req.text, vox, queue, loop,
+            )
+        else:
+            loop.run_in_executor(
+                _gpu_executor, _generate_mlx_stream, req.text, req.voice_id, queue, loop,
+            )
 
         async def body():
             chunks: list[bytes] = []
