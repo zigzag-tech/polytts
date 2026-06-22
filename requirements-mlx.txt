@@ -1,4 +1,4 @@
 # MLX backend (Apple Silicon only)
 mlx>=0.31.0
-mlx-audio>=0.3.1
+mlx-audio>=0.4.4  # >=0.4.4 ships the voxcpm2 MLX model (model_type "voxcpm2")
 mlx-lm>=0.30.5
