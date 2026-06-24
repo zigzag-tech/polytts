@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, ModelManager, pcm16
+from engines import QwenEngine, VoxcpmEngine, pcm16
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -80,7 +80,8 @@ _mlx_prompt_cache: OrderedDict[str, dict] = OrderedDict()
 
 # Manager path (non-MLX): the one-model-in-VRAM manager + a GPU-free registry of
 # voices (voice_id -> {engine, dir, meta}) scanned from disk at startup.
-manager: ModelManager | None = None
+manager = None        # polycore.ModelManager, set by attach() below
+residence = None      # LivestackCoordinator (None in standalone / mlx mode)
 voice_registry: "OrderedDict[str, dict]" = OrderedDict()
 
 # MLX runtime, voxcpm engine: a lazily-loaded second model + a GPU-free registry
@@ -95,6 +96,43 @@ _mlx_voxcpm_voices: "OrderedDict[str, dict]" = OrderedDict()
 _gpu_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="gpu",
 )
+
+# --- polycore + livestack residency (same wiring as polyasr) ----------------
+# Build polycore ManagedUnits — the default engine is HARD_PIN (benchday needs TTS
+# hot at all times) — then attach() builds the manager+coordinator and mounts
+# /livestack. Exclusive (coload=False): one engine in VRAM at a time, the other
+# evicted on switch. Without livestack, polycore's LocalCoordinator reproduces the
+# standalone one-model-in-VRAM + idle-evict behaviour. No hard dependency.
+HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0"))
+if _MANAGER_PATH:
+    from polycore import ManagedUnit, ResidencyPolicy, free_cuda
+
+    def _engine_unit(name, engine, pin):
+        def loader():
+            engine.load()
+            return engine          # ensure() returns the Engine, as callers expect
+        def freer():
+            engine.unload()
+            free_cuda()
+        return ManagedUnit(name, loader, freer,
+                           residency_policy=(ResidencyPolicy.HARD_PIN if pin
+                                             else ResidencyPolicy.UNPINNED))
+
+    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine()}
+    _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
+
+    def _gpu_call(fn):
+        """Run a thunk on the single GPU executor (warm/evict from /livestack)."""
+        return _gpu_executor.submit(fn).result()
+
+    try:
+        from livestack_node import attach
+        manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
+                                    idle_seconds=IDLE_EVICT_SECONDS, coload=False,
+                                    gpu_call=_gpu_call)
+    except ImportError:
+        from polycore import ModelManager
+        manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
 
 # ---------------------------------------------------------------------------
 # Admission control — bound concurrent in-flight streaming syntheses so a burst
@@ -594,11 +632,11 @@ async def startup():
                 print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
         return
 
-    # Manager path (CUDA/MPS/CPU): models load lazily; one resident at a time;
-    # evicted on engine switch and after IDLE_EVICT_SECONDS of inactivity.
-    manager = ModelManager({"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine()},
-                           IDLE_EVICT_SECONDS)
+    # Manager path: manager + residency were wired by attach() at import. Preload
+    # the pinned default engine (benchday needs it hot) and start the idle sweep,
+    # which calls manager.maybe_evict() -> coordinator.idle_sweep().
     _scan_voice_registry()
+    _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
 
     async def _idle_loop():
         loop = asyncio.get_running_loop()
@@ -611,8 +649,8 @@ async def startup():
                 print(f"[idle] {e}")
 
     asyncio.create_task(_idle_loop())
-    print(f"Manager ready (engines={list(manager.engines)}, "
-          f"default={DEFAULT_ENGINE}, idle_evict={IDLE_EVICT_SECONDS}s)")
+    print(f"Manager ready (units={list(manager.units)}, default={DEFAULT_ENGINE} "
+          f"(pinned), livestack={residence is not None}, idle_evict={IDLE_EVICT_SECONDS}s)")
 
 
 def _hash_audio(data: bytes) -> str:
@@ -1046,7 +1084,7 @@ def health():
         else:
             info["device"] = "cpu"
         info["manager"] = manager.status() if manager else None
-        info["model"] = manager.resident if manager else None
+        info["model"] = sorted(manager.resident) if manager else None
         info["voices"] = sorted(voice_registry.keys())
         info["wav_cache_entries"] = len(cache._store)
 
