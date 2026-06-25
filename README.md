@@ -78,7 +78,20 @@ uv run ./run.sh
 voxlert config set tts_backend qwen
 ```
 
-**Windows:** The scripts above are bash (e.g. `setup.sh`, `run.sh`). Use **WSL** or **Git Bash** to run them, or do the steps manually: create a venv, `pip install -r requirements.txt`, download the PyTorch models (see Troubleshooting → "Model not found"), then run `python server.py` with `POLYTTS_RUNTIME=pytorch` from `polytts`.
+**Windows:** Use the native PowerShell scripts (no WSL or Git Bash needed). Windows
+runs the PyTorch backend — CUDA if you have an NVIDIA GPU, otherwise CPU.
+
+```powershell
+# 1. First-time setup (venv, deps, model download)
+.\setup.ps1
+
+# 2. Start the server
+.\run.ps1
+```
+
+For an NVIDIA GPU, install a CUDA-enabled `torch` build (the default pip install is
+CPU-only) — see the note at the top of `setup.ps1`. The bash scripts also work under
+**WSL** or **Git Bash** if you prefer.
 
 Generate speech directly:
 
