@@ -1,6 +1,45 @@
-# PolyTTS — multi-engine TTS server
+<p align="center">
+  <img src="assets/header.png" alt="polytts — text to speech" width="100%">
+</p>
 
-A FastAPI server for voice-cloned text-to-speech, **agnostic to the underlying TTS engine**. It currently ships two engines — [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) and [VoxCPM](https://huggingface.co/openbmb/VoxCPM2) — and is built so more can be added behind the same API. Upload a short WAV reference plus transcript to create a `voice_id`, then synthesize speech with that voice.
+<h1 align="center">polytts</h1>
+
+<p align="center">
+  <b>A self-hosted text-to-speech server with voice cloning.</b><br>
+  Give it a few seconds of reference audio, then turn any text into speech in that voice.
+</p>
+
+---
+
+**polytts** is a small HTTP server that turns text into natural speech and can
+**clone a voice from a short sample**. Upload a few seconds of reference audio
+plus its transcript to mint a `voice_id`, then synthesize unlimited speech in
+that voice. It's **engine-agnostic** — the same API drives two interchangeable
+TTS models today, [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base)
+and [VoxCPM](https://huggingface.co/openbmb/VoxCPM2), and is built so more can be
+added behind it. It's the text-to-speech half of the `poly*` family, alongside
+its sibling [polyasr](https://github.com/zigzag-tech/polyasr) (speech-to-text).
+
+### What you can do with it
+
+- 🗣️ **Clone a voice** — upload a short reference clip + transcript, get a stable
+  `voice_id` you can reuse forever. (`POST /voices`)
+- 🔊 **Synthesize speech** — send text + a `voice_id`, get back a WAV in that
+  voice, with control over language, temperature, and prosody. (`POST /tts`)
+- 🎚️ **Consistent tone** — VoxCPM voices can lock a tone seed so prosody stays
+  steady across a whole video instead of drifting sentence to sentence.
+
+### Why it exists
+
+- **One API, many engines & GPUs.** The same contract runs on Apple Silicon
+  (MLX, quantized & fast) and on NVIDIA / Apple via PyTorch (CUDA or MPS) —
+  switch engines per-request without touching the client.
+- **Shares the GPU politely.** On the multi-engine path it keeps **at most one
+  model in VRAM**, loading lazily and **idle-evicting** after a timeout, so
+  polytts co-exists with other GPU workloads (such as
+  [polyasr](https://github.com/zigzag-tech/polyasr)) on a single card.
+- **Built for narration.** Streaming PCM output, per-request generation
+  controls, and voice/tone consistency aimed at long-form Chinese narration.
 
 ## Installation
 
