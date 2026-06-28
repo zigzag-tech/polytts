@@ -35,7 +35,11 @@ from engines import QwenEngine, VoxcpmEngine, pcm16
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
 # Non-MLX runtimes use the multi-engine manager (one model in VRAM at a time,
-# evicted on engine-switch and after idle so the shared GPU is freed).
+# evicted on engine-switch and after idle so the shared GPU is freed). MLX uses
+# a separate native-MLX inference path (NOT engines.py, which is the
+# PyTorch/CUDA backend) — so the manager path is PyTorch-only. Making MLX a
+# livestack node requires wrapping the native-MLX load/unload in ManagedUnits,
+# not flipping this flag. See docs/ — deferred.
 _MANAGER_PATH = RUNTIME != "mlx"
 IDLE_EVICT_SECONDS = int(os.environ.get("POLYTTS_IDLE_EVICT_SECONDS", "120"))
 DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
@@ -140,6 +144,57 @@ if _MANAGER_PATH:
     except ImportError:
         from polycore import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
+
+# MLX runtime: the native-MLX models (qwen `model`, voxcpm `_voxcpm_mlx`) are held
+# as globals and served by a separate native path (NOT engines.py, the PyTorch
+# backend). Wrap their load/free in ManagedUnits so polytts becomes a livestack
+# node: a host-broker can SEE its Metal footprint and EVICT the heavy voxcpm
+# engine when idle to relieve Metal pressure (e.g. an ASR align-chunk spike).
+# qwen is HARD_PIN (its `model` global is read pervasively in the serving path, so
+# it is never evicted); voxcpm is SOFT_PIN + reached only through the
+# _load_voxcpm_mlx() accessor above, so it reloads safely on next use.
+elif RUNTIME == "mlx":
+    from polycore import ManagedUnit, ResidencyPolicy
+
+    def _qwen_unit_load():
+        _load_mlx()
+        return model
+
+    def _qwen_unit_free():
+        global model
+        model = None
+        import mlx.core as mx
+        mx.clear_cache()
+        gc.collect()
+
+    # Deferred wrappers: the voxcpm raw load/free are defined later in the file.
+    def _voxcpm_unit_load():
+        return _load_voxcpm_mlx_raw()
+
+    def _voxcpm_unit_free():
+        _free_voxcpm_mlx()
+
+    _MLX_UNITS = {
+        "qwen": ManagedUnit("qwen", _qwen_unit_load, _qwen_unit_free,
+                            footprint=3_000_000_000,
+                            residency_policy=ResidencyPolicy.HARD_PIN),
+        "voxcpm": ManagedUnit("voxcpm", _voxcpm_unit_load, _voxcpm_unit_free,
+                              footprint=8_000_000_000,
+                              residency_policy=ResidencyPolicy.SOFT_PIN),
+    }
+
+    def _gpu_call(fn):
+        """Run a thunk on the single MLX GPU executor (facade warm/evict)."""
+        return _gpu_executor.submit(fn).result()
+
+    try:
+        from livestack_node import attach
+        manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
+                                    units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
+                                    coload=True, gpu_call=_gpu_call)
+    except ImportError:
+        manager = None
+        residence = None
 
 # ---------------------------------------------------------------------------
 # Admission control — bound concurrent in-flight streaming syntheses so a burst
@@ -520,8 +575,9 @@ def _generate_mlx_stream(text, voice_id, queue, loop):
 # ---------------------------------------------------------------------------
 # MLX voxcpm engine (second model on the MLX runtime)
 # ---------------------------------------------------------------------------
-def _load_voxcpm_mlx():
-    """Lazily load the MLX voxcpm model. Must run on the GPU executor thread."""
+def _load_voxcpm_mlx_raw():
+    """Actually load the MLX voxcpm model into the global (the ManagedUnit
+    loader). Must run on the GPU executor thread."""
     global _voxcpm_mlx
     if _voxcpm_mlx is None:
         from mlx_audio.tts.utils import load_model
@@ -529,6 +585,27 @@ def _load_voxcpm_mlx():
         _voxcpm_mlx = load_model(MLX_VOXCPM_MODEL_ID)
         print(f"MLX voxcpm loaded. sr={getattr(_voxcpm_mlx, 'sample_rate', '?')}", flush=True)
     return _voxcpm_mlx
+
+
+def _free_voxcpm_mlx():
+    """Drop the MLX voxcpm model and return its Metal memory to the OS (the
+    ManagedUnit freer). Runs when the broker evicts voxcpm under Metal pressure."""
+    global _voxcpm_mlx
+    _voxcpm_mlx = None
+    import mlx.core as mx
+    mx.clear_cache()
+    gc.collect()
+
+
+def _load_voxcpm_mlx():
+    """Lazily load the MLX voxcpm model. Must run on the GPU executor thread.
+    Routed through the residence manager when attached, so a host-broker can
+    evict the heavy (~8 GB) voxcpm engine under Metal pressure and it reloads on
+    the next use (every voxcpm path goes through here). Falls back to a direct
+    load when no manager is wired."""
+    if manager is not None:
+        return manager.ensure("voxcpm")
+    return _load_voxcpm_mlx_raw()
 
 
 def _voxcpm_mlx_sr() -> int:
@@ -628,7 +705,12 @@ def _resolve_engine(req_engine, voice_id):
 async def startup():
     global manager
     if RUNTIME == "mlx":
-        _load_mlx()
+        # Load the HARD_PIN qwen unit through the manager (registers residency
+        # with the broker); direct load if no manager is wired.
+        if manager is not None:
+            manager.ensure("qwen")
+        else:
+            _load_mlx()
         _load_voices_mlx()
         # Pre-load the voxcpm model when voxcpm voices exist so the first
         # request isn't slow. Never fail startup if it can't load.
