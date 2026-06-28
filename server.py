@@ -107,6 +107,9 @@ HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0
 if _MANAGER_PATH:
     from polycore import ManagedUnit, ResidencyPolicy, free_cuda
 
+    # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
+    _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000}
+
     def _engine_unit(name, engine, pin):
         def loader():
             engine.load()
@@ -114,8 +117,12 @@ if _MANAGER_PATH:
         def freer():
             engine.unload()
             free_cuda()
+        # Default engine is SOFT_PIN: preferred-warm but PREEMPTIBLE under GPU
+        # pressure (e.g. an ASR/align burst) — the residence planner restores it
+        # when pressure settles. The other engine is pure demand (UNPINNED).
         return ManagedUnit(name, loader, freer,
-                           residency_policy=(ResidencyPolicy.HARD_PIN if pin
+                           footprint=_FOOTPRINTS.get(name, 0),
+                           residency_policy=(ResidencyPolicy.SOFT_PIN if pin
                                              else ResidencyPolicy.UNPINNED))
 
     _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine()}
