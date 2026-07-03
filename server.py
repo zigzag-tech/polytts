@@ -68,6 +68,20 @@ MLX_VOXCPM_MODEL_ID = os.environ.get("POLYTTS_MLX_VOXCPM_MODEL", "mlx-community/
 MLX_VOXCPM_CFG = float(os.environ.get("POLYTTS_MLX_VOXCPM_CFG", "2.0"))
 MLX_VOXCPM_STEPS = int(os.environ.get("POLYTTS_MLX_VOXCPM_STEPS", "10"))
 
+# Per-engine cap on chars (and sentences) per SINGLE model generation. VoxCPM
+# quality degrades on long continuous generation (~>3 sentences / ~80 CJK
+# chars): long input is split into multiple generations and the audio
+# concatenated into one seamless response. Engines not listed here have NO
+# server-side cap (qwen etc. are robust to long text). A client may override
+# per-request via max_chars_per_gen / max_sentences_per_gen (0 = unlimited),
+# at its own risk.
+MAX_CHARS_PER_GEN = {
+    "voxcpm": int(os.environ.get("POLYTTS_VOXCPM_MAX_CHARS", "80")),
+}
+MAX_SENTENCES_PER_GEN = {
+    "voxcpm": int(os.environ.get("POLYTTS_VOXCPM_MAX_SENTENCES", "3")),
+}
+
 app = FastAPI(title="PolyTTS Server")
 
 # Filled at startup
@@ -246,6 +260,71 @@ def _split_sentences(text):
     if seg:
         out.append(seg)
     return out or [text]
+
+
+# Clause-level punctuation used to hard-split a single over-long sentence.
+_CLAUSE_ENDERS = ",;，；、、"
+
+
+def _hard_split_clause(sentence, max_chars):
+    """Split one over-long sentence into pieces each <= max_chars, breaking on
+    clause punctuation first, then hard on character count as a last resort."""
+    if not max_chars or len(sentence) <= max_chars:
+        return [sentence]
+    pieces, buf = [], ""
+    for ch in sentence:
+        buf += ch
+        if ch in _CLAUSE_ENDERS and len(buf) >= max_chars:
+            pieces.append(buf)
+            buf = ""
+    if buf:
+        pieces.append(buf)
+    out = []
+    for p in pieces:
+        if len(p) <= max_chars:
+            out.append(p)
+        else:
+            for i in range(0, len(p), max_chars):
+                out.append(p[i:i + max_chars])
+    return out or [sentence]
+
+
+def _chunk_text(text, max_chars, max_sentences):
+    """Greedily pack sentences into generation chunks, each <= max_chars chars
+    and <= max_sentences sentences, so a single model generation never runs
+    long enough for quality to degrade. max_chars=0 / max_sentences=0 disables
+    that limit; both 0 -> one chunk (no chunking). Over-long single sentences
+    are hard-split on clause boundaries."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    no_char_cap = not max_chars
+    no_sent_cap = not max_sentences
+    if no_char_cap and no_sent_cap:
+        return [text]
+    sentences = _split_sentences(text)
+    if (no_char_cap or len(text) <= max_chars) and (no_sent_cap or len(sentences) <= max_sentences):
+        return [text]
+    chunks, cur, cur_sents = [], "", 0
+    for s in sentences:
+        if max_chars and len(s) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur, cur_sents = "", 0
+            for piece in _hard_split_clause(s, max_chars):
+                chunks.append(piece)
+            continue
+        candidate = (cur + s) if cur else s
+        overflow_chars = max_chars and len(candidate) > max_chars
+        overflow_sents = max_sentences and cur_sents + 1 > max_sentences
+        if cur and (overflow_chars or overflow_sents):
+            chunks.append(cur)
+            cur, cur_sents = s, 1
+        else:
+            cur, cur_sents = candidate, cur_sents + 1
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
 
 
 _LANG_NAMES = {
@@ -623,18 +702,23 @@ def _voxcpm_mlx_kwargs(voice: dict) -> dict:
     )
 
 
-def _generate_voxcpm_mlx(text: str, voice: dict) -> bytes:
-    """One complete WAV from the MLX voxcpm model (GPU executor thread)."""
+def _generate_voxcpm_mlx(text: str, voice: dict, chunks=None) -> bytes:
+    """One complete WAV from the MLX voxcpm model (GPU executor thread).
+
+    Long text is synthesized one chunk at a time (see _chunk_text) and the
+    audio concatenated, so a single generation never runs past the VoxCPM cap."""
     import mlx.core as mx
 
     m = _load_voxcpm_mlx()
-    chunks, sample_rate = [], None
-    for result in m.generate(text=text, **_voxcpm_mlx_kwargs(voice)):
-        chunks.append(np.array(result.audio))
-        if sample_rate is None:
-            sample_rate = result.sample_rate
-    audio = np.concatenate(chunks)
-    del chunks
+    for_chunks = chunks if chunks else [text]
+    parts, sample_rate = [], None
+    for ch in for_chunks:
+        for result in m.generate(text=ch, **_voxcpm_mlx_kwargs(voice)):
+            parts.append(np.array(result.audio))
+            if sample_rate is None:
+                sample_rate = result.sample_rate
+    audio = np.concatenate(parts)
+    del parts
     mx.clear_cache()
     gc.collect()
     buf = io.BytesIO()
@@ -642,12 +726,13 @@ def _generate_voxcpm_mlx(text: str, voice: dict) -> bytes:
     return buf.getvalue()
 
 
-def _generate_voxcpm_mlx_stream(text, voice, queue, loop):
+def _generate_voxcpm_mlx_stream(text, voice, queue, loop, chunks=None):
     """Push s16le PCM from the MLX voxcpm model onto `queue` (GPU thread).
 
     VoxCPM2 decodes a clip per generate() call (one yield), so /tts/stream emits
     it at sentence granularity — same shape as the manager path, but with the
-    model resident (no cold start)."""
+    model resident (no cold start). Long input is pre-split into cap-bounded
+    chunks (one generation each) so quality does not degrade on long text."""
     import mlx.core as mx
 
     def push(item):
@@ -655,10 +740,12 @@ def _generate_voxcpm_mlx_stream(text, voice, queue, loop):
 
     try:
         m = _load_voxcpm_mlx()
-        for result in m.generate(text=text, **_voxcpm_mlx_kwargs(voice)):
-            pcm = _float_to_pcm16(result.audio)
-            if pcm:
-                push(pcm)
+        for_chunks = chunks if chunks else [text]
+        for ch in for_chunks:
+            for result in m.generate(text=ch, **_voxcpm_mlx_kwargs(voice)):
+                pcm = _float_to_pcm16(result.audio)
+                if pcm:
+                    push(pcm)
         mx.clear_cache()
         gc.collect()
         push(_STREAM_DONE)
@@ -860,6 +947,10 @@ class TTSRequest(BaseModel):
     subtalker_top_p: float | None = None
     max_new_tokens: int | None = None
     non_streaming_mode: bool | None = None
+    # Server-side generation chunking override (at the caller's own risk).
+    # None = use the engine's default cap; 0 = unlimited (one generation).
+    max_chars_per_gen: int | None = None
+    max_sentences_per_gen: int | None = None
 
 
 def _generation_kwargs(req: TTSRequest) -> dict:
@@ -874,6 +965,18 @@ def _generation_kwargs(req: TTSRequest) -> dict:
         "max_new_tokens",
     )
     return {key: getattr(req, key) for key in fields if getattr(req, key) is not None}
+
+
+def _gen_chunks(engine_name, req):
+    """Split req.text into per-generation chunks bounded by the engine's
+    server-side cap (overridable per-request). Returns [] only for empty text."""
+    mc = req.max_chars_per_gen
+    if mc is None:
+        mc = MAX_CHARS_PER_GEN.get(engine_name, 0)
+    ms = req.max_sentences_per_gen
+    if ms is None:
+        ms = MAX_SENTENCES_PER_GEN.get(engine_name, 0)
+    return _chunk_text(req.text, mc, ms)
 
 
 @app.post("/tts")
@@ -891,9 +994,10 @@ async def tts(req: TTSRequest):
             cached = cache.get(vox_key)
             if cached is not None:
                 return Response(content=cached, media_type="audio/wav")
+            vox_chunks = _gen_chunks("voxcpm", req)
             try:
                 wav_bytes = await asyncio.wait_for(
-                    loop.run_in_executor(_gpu_executor, _generate_voxcpm_mlx, req.text, vox),
+                    loop.run_in_executor(_gpu_executor, _generate_voxcpm_mlx, req.text, vox, vox_chunks),
                     timeout=TTS_TIMEOUT)
             except asyncio.TimeoutError:
                 raise HTTPException(504, "TTS generation timed out")
@@ -931,11 +1035,21 @@ async def tts(req: TTSRequest):
 
     def job():
         eng = manager.ensure(engine_name)
-        audio, sr = eng.generate(
-            req.text, req.voice_id, entry["dir"], entry["meta"], language,
-            {**gen_kwargs, "non_streaming_mode": non_streaming_mode})
+        # VoxCPM etc. degrade on long continuous generation: synthesize one
+        # chunk at a time and concatenate, so a single model call never runs
+        # past the engine's cap.
+        chunks = _gen_chunks(engine_name, req)
+        parts, sr = [], None
+        for ch in chunks:
+            audio, _sr = eng.generate(
+                ch, req.voice_id, entry["dir"], entry["meta"], language,
+                {**gen_kwargs, "non_streaming_mode": non_streaming_mode})
+            parts.append(np.asarray(audio, dtype=np.float32))
+            if sr is None:
+                sr = _sr
+        audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
         buf = io.BytesIO()
-        sf.write(buf, audio, sr, subtype="PCM_16", format="WAV")
+        sf.write(buf, audio, sr or eng.sample_rate, subtype="PCM_16", format="WAV")
         return buf.getvalue()
 
     try:
@@ -1007,9 +1121,10 @@ async def tts_stream(req: TTSRequest):
         # Kick off generation on the GPU thread; do NOT await — chunks arrive via
         # the queue.  The future is intentionally not held: if the client
         # disconnects, generation runs to completion and its chunks are dropped.
+        vox_chunks = _gen_chunks("voxcpm", req) if vox is not None else None
         if vox is not None:
             loop.run_in_executor(
-                _gpu_executor, _generate_voxcpm_mlx_stream, req.text, vox, queue, loop,
+                _gpu_executor, _generate_voxcpm_mlx_stream, req.text, vox, queue, loop, vox_chunks,
             )
         else:
             loop.run_in_executor(
@@ -1071,7 +1186,7 @@ async def tts_stream(req: TTSRequest):
         language = _lang_name(req.language)
         gen_kwargs = _generation_kwargs(req)
         non_streaming_mode = req.non_streaming_mode if req.non_streaming_mode is not None else False
-        sentences = _split_sentences(req.text)
+        gen_chunks = _gen_chunks(engine_name, req)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -1083,9 +1198,9 @@ async def tts_stream(req: TTSRequest):
         def worker():
             try:
                 e = manager.ensure(engine_name)
-                for sent in sentences:
+                for gch in gen_chunks:
                     for chunk in e.stream(
-                        sent, req.voice_id, entry["dir"], entry["meta"], language,
+                        gch, req.voice_id, entry["dir"], entry["meta"], language,
                         {**gen_kwargs, "non_streaming_mode": non_streaming_mode},
                     ):
                         pcm = pcm16(chunk)
