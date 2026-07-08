@@ -990,7 +990,8 @@ async def tts(req: TTSRequest):
         # voxcpm voice → MLX voxcpm model (its own cache namespace + 48 kHz).
         vox = _mlx_voxcpm_voices.get(req.voice_id) if req.voice_id else None
         if vox is not None:
-            vox_key = ("voxcpm", req.text, req.voice_id, language)
+            vox_key = ("voxcpm", req.text, req.voice_id, language,
+                       req.max_chars_per_gen, req.max_sentences_per_gen)
             cached = cache.get(vox_key)
             if cached is not None:
                 return Response(content=cached, media_type="audio/wav")
@@ -1028,7 +1029,8 @@ async def tts(req: TTSRequest):
         raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
 
     cache_key = (engine_name, req.text, req.voice_id, language, non_streaming_mode,
-                 json.dumps(gen_kwargs, sort_keys=True))
+                 json.dumps(gen_kwargs, sort_keys=True),
+                 req.max_chars_per_gen, req.max_sentences_per_gen)
     cached = cache.get(cache_key)
     if cached is not None:
         return Response(content=cached, media_type="audio/wav")
