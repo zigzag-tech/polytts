@@ -951,6 +951,13 @@ class TTSRequest(BaseModel):
     # None = use the engine's default cap; 0 = unlimited (one generation).
     max_chars_per_gen: int | None = None
     max_sentences_per_gen: int | None = None
+    # VoxCPM generation-quality overrides (engine default when None):
+    #   cfg_value = classifier-free-guidance / clone strength (lower = more natural)
+    #   inference_timesteps = denoising steps (higher = cleaner, slower)
+    #   denoise = denoise the reference/seed audio before cloning
+    cfg_value: float | None = None
+    inference_timesteps: int | None = None
+    denoise: bool | None = None
 
 
 def _generation_kwargs(req: TTSRequest) -> dict:
@@ -963,6 +970,9 @@ def _generation_kwargs(req: TTSRequest) -> dict:
         "subtalker_top_k",
         "subtalker_top_p",
         "max_new_tokens",
+        "cfg_value",
+        "inference_timesteps",
+        "denoise",
     )
     return {key: getattr(req, key) for key in fields if getattr(req, key) is not None}
 

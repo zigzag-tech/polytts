@@ -146,9 +146,12 @@ class QwenEngine(Engine):
 
     def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
         self.prepare_voice(voice_id, voice_dir, meta)
+        # Strip VoxCPM-only knobs before forwarding to the qwen model.
+        gk = {k: v for k, v in gen_kwargs.items()
+              if k not in ("cfg_value", "inference_timesteps", "denoise")}
         wavs, sr = self._model.generate_voice_clone(
             text=text, language=language or "Chinese",
-            voice_clone_prompt=self._prompts[voice_id], **gen_kwargs)
+            voice_clone_prompt=self._prompts[voice_id], **gk)
         return np.asarray(wavs[0], dtype=np.float32), sr
 
 
@@ -184,22 +187,31 @@ class VoxcpmEngine(Engine):
         _trim_ram()
         print("[voxcpm] unloaded.", flush=True)
 
-    def _clone_kwargs(self, voice_dir: Path, meta: dict) -> dict:
-        """reference clip = timbre; optional seed clip = locked tone."""
+    def _clone_kwargs(self, voice_dir: Path, meta: dict, gen_kwargs: dict | None = None) -> dict:
+        """reference clip = timbre; optional seed clip = locked tone.
+
+        Per-request overrides (cfg_value / inference_timesteps / denoise) are
+        read from gen_kwargs; absent -> engine env defaults."""
+        gk = gen_kwargs or {}
         kw = dict(reference_wav_path=str(voice_dir / "voice.wav"),
-                  cfg_value=self._cfg, inference_timesteps=self._steps, normalize=True)
+                  cfg_value=gk.get("cfg_value", self._cfg),
+                  inference_timesteps=gk.get("inference_timesteps", self._steps),
+                  normalize=True)
         seed = voice_dir / "seed.wav"
         if seed.exists() and meta.get("seed_text"):
             kw["prompt_wav_path"] = str(seed)
             kw["prompt_text"] = meta["seed_text"]
+        if gk.get("denoise"):
+            kw["denoise"] = True
         return kw
 
     def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
-        audio = self._model.generate(text=text, **self._clone_kwargs(voice_dir, meta))
+        audio = self._model.generate(text=text, **self._clone_kwargs(voice_dir, meta, gen_kwargs))
         return np.asarray(audio, dtype=np.float32), self.sample_rate
 
     def stream(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
-        for chunk in self._model.generate_streaming(text=text, **self._clone_kwargs(voice_dir, meta)):
+        ck = self._clone_kwargs(voice_dir, meta, gen_kwargs)
+        for chunk in self._model.generate_streaming(text=text, **ck):
             yield np.asarray(chunk, dtype=np.float32)
 
 
