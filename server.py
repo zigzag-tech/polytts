@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, pcm16
+from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, pcm16
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -126,7 +126,7 @@ if _MANAGER_PATH:
     from polycore import ManagedUnit, ResidencyPolicy, free_cuda
 
     # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
-    _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000}
+    _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000, "cosyvoice": 3_000_000_000}
 
     def _engine_unit(name, engine, pin):
         def loader():
@@ -143,7 +143,7 @@ if _MANAGER_PATH:
                            residency_policy=(ResidencyPolicy.SOFT_PIN if pin
                                              else ResidencyPolicy.UNPINNED))
 
-    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine()}
+    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(), "cosyvoice": CosyvoiceEngine()}
     _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
 
     def _gpu_call(fn):
@@ -896,7 +896,7 @@ async def upload_voice(
         return {"voice_id": voice_id}
 
     # ----- Manager path -----
-    if engine not in ("qwen", "voxcpm"):
+    if engine not in ("qwen", "voxcpm", "cosyvoice"):
         raise HTTPException(400, f"Unknown engine: {engine}")
     seed_bytes = await seed_audio.read() if seed_audio is not None else b""
 
@@ -958,6 +958,9 @@ class TTSRequest(BaseModel):
     cfg_value: float | None = None
     inference_timesteps: int | None = None
     denoise: bool | None = None
+    # CosyVoice instruct (emotion/style) — e.g. "请用温暖的语气" or "用沉稳严肃的语调".
+    # Only the cosyvoice engine honors this; ignored by qwen/voxcpm.
+    instruct: str | None = None
 
 
 def _generation_kwargs(req: TTSRequest) -> dict:
@@ -973,6 +976,7 @@ def _generation_kwargs(req: TTSRequest) -> dict:
         "cfg_value",
         "inference_timesteps",
         "denoise",
+        "instruct",
     )
     return {key: getattr(req, key) for key in fields if getattr(req, key) is not None}
 

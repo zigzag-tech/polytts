@@ -17,11 +17,14 @@ Engines:
 """
 import os
 import gc
+import io
 import time
 import threading
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
+import requests
 
 
 def pcm16(audio_f32) -> bytes:
@@ -146,9 +149,9 @@ class QwenEngine(Engine):
 
     def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
         self.prepare_voice(voice_id, voice_dir, meta)
-        # Strip VoxCPM-only knobs before forwarding to the qwen model.
+        # Strip VoxCPM/CosyVoice-only knobs before forwarding to the qwen model.
         gk = {k: v for k, v in gen_kwargs.items()
-              if k not in ("cfg_value", "inference_timesteps", "denoise")}
+              if k not in ("cfg_value", "inference_timesteps", "denoise", "instruct")}
         wavs, sr = self._model.generate_voice_clone(
             text=text, language=language or "Chinese",
             voice_clone_prompt=self._prompts[voice_id], **gk)
@@ -213,6 +216,72 @@ class VoxcpmEngine(Engine):
         ck = self._clone_kwargs(voice_dir, meta, gen_kwargs)
         for chunk in self._model.generate_streaming(text=text, **ck):
             yield np.asarray(chunk, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# CosyVoice 3 engine (via an isolated sidecar process)
+# ---------------------------------------------------------------------------
+class CosyvoiceEngine(Engine):
+    """CosyVoice 3 — zero-shot voice clone + instruct (emotion/style) control,
+    the one real TONE lever (VoxCPM cannot vary tone). CosyVoice pins torch 2.3.1
+    which conflicts with this venv (torch 2.12 for qwen/voxcpm), so it runs in a
+    separate `cosyvoice` conda env as a sidecar HTTP service (cosyvoice_worker.py
+    on 127.0.0.1:8101). This engine is a thin client; PolyTTS's ModelManager still
+    orchestrates VRAM — load()/unload() ask the sidecar to load/free the model
+    (evicting voxcpm first since the manager keeps one engine in VRAM)."""
+    name = "cosyvoice"
+    sample_rate = 24000
+
+    def __init__(self, base_url="http://127.0.0.1:8101"):
+        self.base_url = base_url
+        self._loaded = False
+        self.model_name = "Fun-CosyVoice3-0.5B"
+
+    @property
+    def loaded(self) -> bool:
+        return self._loaded
+
+    def load(self):
+        try:
+            r = requests.post(f"{self.base_url}/load", timeout=600)
+            r.raise_for_status()
+            self.sample_rate = int(r.json().get("sample_rate", self.sample_rate))
+            self._loaded = True
+            print(f"[cosyvoice] sidecar model loaded (sr={self.sample_rate})", flush=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"cosyvoice sidecar load failed — is cosyvoice_worker.py running on "
+                f"{self.base_url}? (conda run -n cosyvoice python cosyvoice_worker.py): {e}")
+
+    def unload(self):
+        try:
+            requests.post(f"{self.base_url}/unload", timeout=120)
+        except Exception:
+            pass
+        self._loaded = False
+        print("[cosyvoice] sidecar model unloaded", flush=True)
+
+    def _synth(self, text, voice_dir, meta, gen_kwargs):
+        instruct = gen_kwargs.get("instruct")
+        body = {"text": text,
+                "voice_wav_path": str(voice_dir / "voice.wav"),
+                "ref_text": meta.get("ref_text", "")}
+        if instruct:
+            body["instruct"] = instruct
+        r = requests.post(f"{self.base_url}/tts", json=body, timeout=900)
+        r.raise_for_status()
+        sr = int(r.headers.get("X-Sample-Rate", self.sample_rate))
+        audio, _ = sf.read(io.BytesIO(r.content), dtype="float32")
+        return np.asarray(audio, dtype=np.float32), sr
+
+    def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        return self._synth(text, voice_dir, meta, gen_kwargs)
+
+    def stream(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        # CosyVoice streams per-sentence internally; default to one chunk here.
+        audio, sr = self._synth(text, voice_dir, meta, gen_kwargs)
+        self.sample_rate = sr
+        yield audio
 
 
 # ---------------------------------------------------------------------------
