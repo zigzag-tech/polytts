@@ -123,7 +123,7 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
 # standalone one-model-in-VRAM + idle-evict behaviour. No hard dependency.
 HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0"))
 if _MANAGER_PATH:
-    from polycore import ManagedUnit, ResidencyPolicy, free_cuda
+    from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda
 
     # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000, "cosyvoice": 3_000_000_000}
@@ -156,7 +156,7 @@ if _MANAGER_PATH:
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
                                     gpu_call=_gpu_call)
     except ImportError:
-        from polycore import ModelManager
+        from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
 
 # MLX runtime: the native-MLX models (qwen `model`, voxcpm `_voxcpm_mlx`) are held
@@ -168,7 +168,7 @@ if _MANAGER_PATH:
 # it is never evicted); voxcpm is SOFT_PIN + reached only through the
 # _load_voxcpm_mlx() accessor above, so it reloads safely on next use.
 elif RUNTIME == "mlx":
-    from polycore import ManagedUnit, ResidencyPolicy
+    from livestack_node import ManagedUnit, ResidencyPolicy
 
     def _qwen_unit_load():
         _load_mlx()
