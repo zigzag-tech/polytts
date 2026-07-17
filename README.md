@@ -288,6 +288,11 @@ Create `~/Library/LaunchAgents/com.voxlert.polytts.plist`:
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/Users/YOU/Library/Logs/polytts.log</string>
     <key>StandardErrorPath</key>
@@ -301,7 +306,25 @@ Create `~/Library/LaunchAgents/com.voxlert.polytts.plist`:
 </plist>
 ```
 
-Replace `/FULL/PATH/TO/` and `/Users/YOU/` with real paths. Then load it:
+Replace `/FULL/PATH/TO/` and `/Users/YOU/` with real paths.
+
+`KeepAlive`/`SuccessfulExit=false` retries on any non-zero exit. Without it a
+single failed start is permanent: launchd never retries and the server is
+silently down until someone notices. A clean `exit(0)` still stops the job.
+
+> **If polytts lives on an external volume (macOS):** the agent will fail with a
+> bare `/bin/bash: …/run.sh: Operation not permitted` — EPERM on a 755 file,
+> same uid. That is macOS TCC (`kTCCServiceSystemPolicyRemovableVolumes`), not
+> POSIX. launchd agents have no responsible app, so they get no grant; your
+> terminal works because *it* holds Full Disk Access and children inherit the
+> responsible process's grant — so testing from a shell will not reproduce it.
+> Fix: grant Full Disk Access to the binary launchd execs (`/bin/bash` here) in
+> System Settings → Privacy & Security, or keep the code+venv on the internal
+> disk. Worse, a process that is *already running* parks uninterruptibly in
+> `__WAITING_ON_APPROVAL_FROM_SANDBOXD__` on its first cold file open — at 0%
+> CPU, while `/health` keeps returning 200.
+
+Then load it:
 
 ```bash
 # Load (starts immediately and on every future login)
