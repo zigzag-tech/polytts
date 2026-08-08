@@ -257,6 +257,26 @@ curl http://localhost:8100/health | python3 -m json.tool
 | `run.sh` | Starts the server using `venv/bin/python`, `python`, or `python3` |
 | `setup.sh` | First-time setup: creates or repairs `venv`, installs deps, downloads models |
 
+### The MLX path needs `livestack-node`, and nothing installs it for you
+
+On Apple Silicon (`POLYTTS_RUNTIME=mlx`) `server.py` hard-imports
+`livestack_node`, so polytts can publish its Metal footprint and let a host
+broker evict the heavy voxcpm engine under pressure. It is a private package and
+is deliberately absent from `requirements-mlx.txt` (see the note there), so an
+MLX host needs it installed by hand into the venv `run.sh` will resolve:
+
+```bash
+./setup.sh                                   # creates venv/
+venv/bin/pip install -e ../../livestack/node-py
+```
+
+`run.sh` prefers `venv/bin/python`, and only falls back to a bare `python3` +
+`uv` bootstrap when no venv exists. That fallback **cannot** supply
+`livestack-node` — uv installs from the requirements files, and this package is
+not in them — so an MLX host with no venv will import-fail on every start. If
+you see `ModuleNotFoundError: No module named 'livestack_node'`, the venv is
+missing, not the dependency.
+
 ## Voices
 
 Uploaded voices live in `polytts/voices/`. Each voice directory contains:
@@ -340,7 +360,16 @@ launchctl list | grep polytts
 tail -f ~/Library/Logs/polytts.log
 ```
 
-**Note:** `run.sh` already restarts the server up to 10 times on crash, so the plist does not set `KeepAlive`. If the script itself exits (crash budget exhausted or clean shutdown), launchd will not re-launch it. To also let launchd restart the script after budget exhaustion, add `<key>KeepAlive</key><true/>` to the plist.
+**Note:** `run.sh` restarts the server up to 10 times, 3 s apart, before giving
+up — but that budget only bounds crashes *of the server*. It does not bound
+relaunches of the script, and every supervisor config documented here
+(`SuccessfulExit=false`, `Restart=on-failure`, `Restart=always`) relaunches
+`run.sh` when it exits non-zero. So a failure that is fatal at *startup* —
+a missing dependency, an unreadable model path — is not a bounded 10-crash
+budget; it is an unbounded hot loop, and it writes to `StandardOutPath` forever.
+Watch the log size after any change to requirements or model config, and rotate
+that file. (A missing `requests` did exactly this on one host: 44,728 relaunches
+and a 60 MB log before anyone looked.)
 
 ### Linux (systemd user service)
 

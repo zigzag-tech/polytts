@@ -4,3 +4,4 @@ soundfile
 pydantic
 python-multipart
 numpy
+requests

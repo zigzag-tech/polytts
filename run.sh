@@ -51,7 +51,7 @@ if ! PYTHON_BIN="$(resolve_python)"; then
     exit 1
 fi
 
-if ! "$PYTHON_BIN" -c "import fastapi, soundfile" >/dev/null 2>&1; then
+if ! "$PYTHON_BIN" -c "import fastapi, soundfile, requests" >/dev/null 2>&1; then
     if command -v uv >/dev/null 2>&1 && [[ "${POLYTTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
         echo "==> Python dependencies are missing for $PYTHON_BIN. Bootstrapping with uv…"
         uv_bootstrap
@@ -67,8 +67,15 @@ restarts=0
 
 while true; do
     echo "==> Starting PolyTTS server (restart #$restarts)…"
+    # `set -e` (line 2) aborts the whole script the instant server.py exits
+    # non-zero, so without this the crash budget below is unreachable code and
+    # every restart is really the supervisor's — uncounted, uncooled. Observed
+    # on xc-mac-studio: 44,728 relaunches, a 60 MB log, and neither "Restarting
+    # in 3s" nor "giving up" ever printed once.
+    set +e
     POLYTTS_RUNTIME=${POLYTTS_RUNTIME:-mlx} "$PYTHON_BIN" server.py
     exit_code=$?
+    set -e
 
     if [[ $exit_code -eq 0 ]]; then
         echo "==> Server exited cleanly."

@@ -1,4 +1,16 @@
 # MLX backend (Apple Silicon only)
+#
+# NOT LISTED HERE, BUT REQUIRED: `livestack-node`. server.py's MLX branch does a
+# hard `from livestack_node import ManagedUnit, ResidencyPolicy` — that is the
+# whole point of the MLX path (polytts registers its Metal footprint so a host
+# broker can evict voxcpm under pressure). It is a private package installed
+# from a sibling livestack checkout (`pip install -e ../../livestack/node-py`),
+# so it cannot go in this file: a git+ssh line would make `uv run ./run.sh` fail
+# for anyone without repo access, which is worse than the honest gap.
+#
+# Consequence to know about: an MLX host without it starts, imports, and dies at
+# server.py — repeatedly. See the crash-budget note in README's auto-start
+# section before assuming a supervisor will bound that.
 mlx>=0.31.0
 mlx-audio>=0.4.4  # >=0.4.4 ships the voxcpm2 MLX model (model_type "voxcpm2")
 mlx-lm>=0.30.5
