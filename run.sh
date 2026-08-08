@@ -20,6 +20,20 @@ resolve_python() {
         printf '%s\n' "$SCRIPT_DIR/venv/bin/python3"
         return 0
     fi
+    # A venv/ that exists but holds no usable interpreter is a BROKEN venv, not
+    # an absent one, and the two must not share a fallback. Falling through here
+    # picks a system python that has none of the venv's packages — so the deps
+    # check below "fails", uv bootstraps an environment that cannot contain the
+    # private livestack-node, and the server import-crashes forever. The venv is
+    # right there with 1.4 GB of packages in it; the symlink is what died.
+    # Seen on xc-mac-studio: venv/bin/python -> python3.13 -> a uv-managed
+    # CPython that uv later removed. Dangling symlink, silent downgrade,
+    # 44,728 relaunches.
+    # Return 2, distinct from 1: a MISSING environment is what uv bootstrap is
+    # for, a BROKEN one is not. Bootstrapping over it hides the breakage.
+    if [[ -d "$SCRIPT_DIR/venv" ]]; then
+        return 2
+    fi
     if command -v python >/dev/null 2>&1; then
         command -v python
         return 0
@@ -41,7 +55,21 @@ uv_bootstrap() {
     exec env POLYTTS_UV_BOOTSTRAPPED=1 uv "${uv_args[@]}" ./run.sh
 }
 
-if ! PYTHON_BIN="$(resolve_python)"; then
+set +e
+PYTHON_BIN="$(resolve_python)"
+resolve_rc=$?
+set -e
+
+if (( resolve_rc == 2 )); then
+    echo "venv/ exists but holds no usable interpreter — it is BROKEN, not missing." >&2
+    echo "  Check with: ls -l venv/bin/python   (a dangling symlink is the usual cause)" >&2
+    echo "  Recreate with ./setup.sh. Refusing to fall back to a system python or to" >&2
+    echo "  uv-bootstrap over it: both hide the breakage and neither can supply the" >&2
+    echo "  packages already sitting in venv/." >&2
+    exit 1
+fi
+
+if (( resolve_rc != 0 )); then
     if command -v uv >/dev/null 2>&1 && [[ "${POLYTTS_UV_BOOTSTRAPPED:-0}" != "1" ]]; then
         echo "==> No Python interpreter found. Bootstrapping with uv…"
         uv_bootstrap
