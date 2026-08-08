@@ -152,9 +152,13 @@ if _MANAGER_PATH:
 
     try:
         from livestack_node import attach
+        # `port` is what lets this node report for duty to the host broker on
+        # its own — no LIVESTACK_PEERS entry, no broker restart. It is the one
+        # fact the broker cannot infer (a POST shows it our source address, not
+        # what we listen on), and we already have it right here.
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
-                                    gpu_call=_gpu_call)
+                                    gpu_call=_gpu_call, port=PORT)
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
@@ -205,7 +209,7 @@ elif RUNTIME == "mlx":
         from livestack_node import attach
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
-                                    coload=True, gpu_call=_gpu_call)
+                                    coload=True, gpu_call=_gpu_call, port=PORT)
     except ImportError:
         manager = None
         residence = None
