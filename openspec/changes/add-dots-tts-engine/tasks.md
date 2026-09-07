@@ -108,7 +108,11 @@ Manager path only. Nothing below touches the MLX path in `server.py`.
 
 ## 7. Deliberately not done here
 
-- [ ] 7.1 Confirm with the owner before re-registering any VoxAlert pack in
-      continuation mode — `design.md` → Open questions (1). This is a listening
-      judgement; the numbers alone do not settle it.
+- [x] 7.1 **Resolved 2026-09-07 — the owner declined the switch.** All 10
+      benchday narration packs were measured in both clone modes against a warm
+      VoxCPM baseline (`design.md` → Open questions 1). Continuation wins on
+      similarity 8/10, but dots collapses to 0.16 s of audio on `hl-hev-suit`
+      deterministically and unrecoverably. Owner's call: "If DOTS cannot handle
+      this case, we shouldn't switch." No pack was re-registered; the evaluation
+      voices were removed.
 - [ ] 7.2 Unchain's `TtsProvider` union gains `'dots'` in that repo, not this one.

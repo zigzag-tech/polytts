@@ -191,13 +191,65 @@ resampling in the server.
      generation, not a worse voice. 30 s reference, 289-char transcript.
    - **sc2-protoss-advisor** — 0.911 against 0.945. Small but real.
 
-   The remaining judgement is audible, not numeric: cosine says "close to the
-   reference speaker", not "right for the character". Clips:
-   <https://claude.ai/code/artifact/7f7d0798-3acc-4b17-87e5-6839ae14f87a>
-2. **Is the community MLX port good enough for xc-mac-studio?**
-   `sb1992/dots-tts-mlx` v0.5.1 has streaming, int4/int8 weights and a reference
-   "enrolment" cache, but is unofficial and does not document x-vector-only mode
-   — the mode every VoxAlert pack uses. Until answered, mac-studio stays VoxCPM.
+   Clips: <https://claude.ai/code/artifact/7f7d0798-3acc-4b17-87e5-6839ae14f87a>
+
+   **DECIDED 2026-09-07 by the owner: do not switch benchday narration.** The
+   blocker is not the similarity numbers, it is the failure described below —
+   dots cannot serve one of the ten packs, and cannot be made to.
+
+### The collapse — why the migration stopped
+
+Some `(reference, text)` pairs make dots emit EOS almost immediately and return
+**0.16 s of audio for a whole sentence**. On this host, over ten packs × six
+realistic narration lines: **2 of 60 generations (3.3%)** — and both were
+`hl-hev-suit`, 2 of its 6 lines. The other nine packs were clean across 54.
+
+It is not a flake, and it does not recover:
+
+| varied | result |
+|---|---|
+| RNG seed (3 values) | collapses identically |
+| `prompt_text` truncated to 289 / 200 / 120 / 60 chars | collapses identically |
+| target line, reworded 4 ways | collapses identically |
+| reference re-encoded mono, 22 kHz, 48 kHz | collapses identically |
+| a *different* line in the same voice | fine |
+| the *same* line in the other nine voices | fine |
+
+The seed cannot move it because the seed feeds the flow-matching noise while the
+**EOS decision belongs to the AR backbone**, which runs deterministically. So a
+redraw costs a full generation and returns the same bytes. Worse, `/tts/stream`
+caches the result on disk: once a pair collapses it is silence forever, and a
+caller cannot distinguish 0.16 s of audio from a genuinely short line.
+
+An earlier draft of this change shipped a seed-walking retry for exactly this.
+**It was removed** once the variance table above showed the seed is not the
+variable — a retry that provably cannot succeed is worse than none, because it
+triples the cost of a failure and reads like recovery. What remains is detection:
+the engine logs the collapsed pair and says plainly that it will not clear.
+
+For narration this is disqualifying at any rate: a character voice that returns
+silence on one line in thirty, permanently, is worse than one that is 0.01 less
+similar to its reference.
+2. **Is the community MLX port good enough for xc-mac-studio?** — **surveyed
+   2026-09-07, still not adopted.** Two unofficial ports exist:
+
+   - **`sb1992/dots-tts-mlx`** — pure-MLX Python port. Has streaming, int4/int8
+     weights (reported lossless against bf16 on transcription accuracy and voice
+     similarity), and a profile/"enrolment" cache that encodes the reference once
+     and persists it, cutting steady state from ~10.8 GB to ~6.6 GB. Apple
+     Silicon only, Python ≥ 3.10.
+   - **`sammcj/mlx-swift-dots-tts`** — MLX Swift port of `dots.tts-soar`, whole
+     pipeline native, no Python daemon. Weights also on HF as
+     `shraey/dots-tts-mlx`.
+
+   Two things still block it for our use. **Peak RAM scales with reference
+   length** — reported ~6 GB for a short clip rising to **~13 GB for a ~30 s
+   reference even at int4**, and benchday's packs carry 8–60 s references. And
+   neither port documents **x-vector-only mode**, the mode every VoxAlert pack
+   uses. Adopting either also means wrapping it in polytts's MLX path, which does
+   not use `engines.py` at all — a separate change, not a config flip.
+
+   xc-mac-studio stays VoxCPM.
 3. **Is SOAR worth a dedicated card?** +1.0 zh SIM over MF NFE 4, at a footprint
    that cannot share a 24 GB GPU with polyasr.
 

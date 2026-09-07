@@ -84,13 +84,34 @@ against their own reference clips. Clips and full table:
 | dots, continuation | **0.871** | **8 / 10** | 0.24 – 0.34 |
 
 A straight engine swap in the packs' existing clone mode is a regression on every
-one of them. Continuation mode is the only version of this switch worth making,
-and it takes two exceptions with it: `hl-hev-suit` collapses to 0.16 s of audio,
-and `sc2-protoss-advisor` slips 0.945 → 0.911.
+one of them. Continuation mode is the only version of the switch worth making.
 
-**No pack has been switched.** The dots-registered voices exist on
-xc-tower-ubuntu (both modes, distinct ids) but `BENCHDAY_NARRATION_PACKS` is
-untouched, so narration still serves VoxCPM everywhere.
+**Decision, 2026-09-07: benchday narration does NOT move to dots.**
+
+The deciding fact is not the similarity table, it is that dots cannot serve
+`hl-hev-suit` at all. Some `(reference, text)` pairs make it emit EOS immediately
+and return **0.16 s of audio for a whole sentence** — 2 of 60 generations here,
+**both on that pack** (2 of its 6 lines; the other nine packs were clean across
+54). The failure survives a changed RNG seed, `prompt_text` truncated four ways,
+four rewordings of the line, and three re-encodings of the reference, because the
+EOS decision is the AR backbone's and runs deterministically. `/tts/stream` then
+caches the short body, so the pair is silent permanently.
+
+A character voice that returns silence on one line in thirty, unrecoverably, is
+worse than one that is 0.01 less similar to its reference. See `design.md` →
+"The collapse".
+
+**Nothing was switched and nothing was left behind.** `BENCHDAY_NARRATION_PACKS`
+is untouched, narration serves VoxCPM on every node, the 33 dots voices
+registered for this evaluation have been removed, and xc-tower-ubuntu is back to
+its original 76 voices with `voxcpm` pinned.
+
+### What the engine is still for
+
+`dots` stays registered and available on the manager path. It is ~2.4× VoxCPM's
+throughput (RTF 0.23 against 0.55) and clean on nine of ten references, so it is
+a reasonable choice for a *new* voice whose reference is verified against it —
+just not a drop-in replacement for a pack set already in service.
 
 ## The one thing to read before implementing
 

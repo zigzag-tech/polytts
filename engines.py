@@ -302,29 +302,81 @@ class DotsEngine(Engine):
             kw["language"] = language
         return kw
 
-    def _seed(self, voice_id: str):
+    # A generation is a COLLAPSE when the model emits EOS almost immediately and
+    # returns a fraction of a second of audio for a whole sentence. English runs
+    # ~14 characters of text per second of speech; under this fraction of that
+    # estimate is not a short reading, it is a failure.
+    #
+    # DETECTION ONLY — there is deliberately no retry. Measured on the reference
+    # that produces it (hl-hev-suit, 30 s of Half-Life HEV announcer audio): the
+    # collapse is reproducible across three different RNG seeds, across
+    # prompt_text truncated to 289/200/120/60 characters, and across four
+    # rewordings of the target line. The seed cannot move it because the seed
+    # feeds the flow-matching noise while the EOS decision is the AR backbone's,
+    # which runs deterministically. A redraw costs a full generation and returns
+    # the same bytes, so this logs and moves on rather than pretending to recover.
+    #
+    # Rate on this host: 2 of 60 generations (3.3%) over ten voice packs and six
+    # realistic narration lines — and BOTH were hl-hev-suit (2 of its 6 lines).
+    # The other nine packs were clean across 54 generations. It is a property of
+    # particular (reference, text) pairs, not a background flake rate.
+    _COLLAPSE_FLOOR_RATIO = 0.25
+    _COLLAPSE_MIN_S = 0.35
+
+    def _seed(self, voice_id: str, text: str):
         """dots.tts draws its flow-matching noise from the GLOBAL torch RNG and
         exposes no seed argument, so a repeat of the same (text, voice) would
         otherwise differ byte-for-byte — which the /tts/stream disk PCM cache
-        assumes it does not. Pin the RNG per voice before every generation.
+        assumes it does not. Pin the RNG per (voice, text) before every generation.
 
-        This is an RNG seed, not a tone lock: the engine has no tone-seed input,
-        so VoxCPM's `seed.wav` / `seed_text` have no meaning here and are ignored.
+        The text is IN the seed deliberately. Seeding from the voice alone makes
+        every phrase in that voice start from one RNG state, so a voice that draws
+        badly draws badly across the board; per-pair seeding keeps one bad draw
+        from correlating with the next.
+
+        This is an RNG seed, not a tone lock: the engine has no tone-seed input, so
+        VoxCPM's `seed.wav` / `seed_text` have no meaning here and are ignored.
         """
         import torch
-        torch.manual_seed(int(hashlib.sha256(voice_id.encode()).hexdigest()[:8], 16))
+        h = hashlib.sha256(f"{voice_id}\x00{text}".encode()).hexdigest()[:8]
+        torch.manual_seed(int(h, 16))
+
+    def _collapsed(self, text: str, samples: int) -> bool:
+        """Did this generation fail rather than merely run short?
+
+        Reported so the pair is identifiable. A caller cannot tell 0.16 s of audio
+        from a very short line, and the /tts/stream disk cache will store the short
+        body and serve it forever after, so without this the failure is invisible
+        in the logs and permanent in the cache.
+        """
+        floor = max(self._COLLAPSE_MIN_S,
+                    (len(text) / 14.0) * self._COLLAPSE_FLOOR_RATIO)
+        return (samples / float(self.sample_rate)) < floor
+
+    def _warn_if_collapsed(self, text, voice_id, samples):
+        if self._collapsed(text, samples):
+            print(f"[dots] COLLAPSED generation: {samples / self.sample_rate:.2f}s of "
+                  f"audio for {len(text)} chars, voice={voice_id}. This pair is "
+                  f"deterministic — it will not clear on retry, and the PCM cache "
+                  f"will keep it. Re-cut the reference or use a different voice.",
+                  flush=True)
 
     def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
-        self._seed(voice_id)
+        self._seed(voice_id, text)
         out = self._rt.generate(text=text, **self._clone_kwargs(voice_dir, meta, language))
         audio = out["audio"].detach().float().cpu().numpy().reshape(-1)
+        self._warn_if_collapsed(text, voice_id, audio.size)
         return np.asarray(audio, dtype=np.float32), int(out.get("sample_rate", self.sample_rate))
 
     def stream(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
-        self._seed(voice_id)
+        self._seed(voice_id, text)
+        n = 0
         for chunk in self._rt.generate_stream(
                 text=text, **self._clone_kwargs(voice_dir, meta, language)):
-            yield chunk.detach().float().cpu().numpy().reshape(-1)
+            a = chunk.detach().float().cpu().numpy().reshape(-1)
+            n += a.size
+            yield a
+        self._warn_if_collapsed(text, voice_id, n)
 
 
 # ---------------------------------------------------------------------------
