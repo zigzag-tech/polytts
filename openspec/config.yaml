@@ -1,0 +1,60 @@
+schema: spec-driven
+
+# Project context — shown to AI when creating artifacts.
+context: |
+  polytts: a self-hosted text-to-speech server with voice cloning. One HTTP API
+  (`POST /voices`, `POST /tts`, `POST /tts/stream`, `GET /health`,
+  `POST /model/unload`) in front of several interchangeable TTS engines.
+
+  Two runtimes, and they are NOT symmetric:
+  - **Manager path** (`_MANAGER_PATH`, any non-MLX runtime): `server.py` builds
+    `_ENGINES` from `engines.py` classes and hands them to a livestack
+    `ModelManager` that keeps at most one engine in VRAM, loading lazily and
+    idle-evicting so polytts shares a GPU with polyasr.
+  - **MLX path** (Apple Silicon): a separate, older in-`server.py` code path with
+    its own voice caches. It does not use `engines.py`. Changes to one path do
+    not reach the other; say which path a change targets.
+
+  Engines today: `qwen` (Qwen3-TTS), `voxcpm` (VoxCPM 2), `cosyvoice`
+  (CosyVoice 3, via an isolated sidecar). An engine subclasses `Engine` in
+  `engines.py` — `load`, `unload`, `loaded`, `prepare_voice`, `generate`,
+  `stream` — and is registered in three places in `server.py`: `_FOOTPRINTS`,
+  `_ENGINES`, and the `/voices` engine allowlist.
+
+  A voice is a directory under `voices/<voice_id>/`: `voice.wav` (timbre
+  reference), optional `seed.wav` (tone lock), and `meta.json` carrying
+  `engine`, `ref_text`, `x_vector_only_mode` and optional `seed_text`. The
+  `voice_id` is a content hash of (audio, engine, mode, seed) so the same
+  reference yields the same id on every node.
+
+  Consumers, and what each actually needs:
+  - **Benchday** narration — `POST /tts/stream`, chunked s16le PCM, sample rate
+    read from the `X-Sample-Rate` response header (so engines may differ in rate).
+  - **VoxAlert** voice packs — `POST /voices` from short, often synthetic
+    reference clips, registered `x_vector_only_mode=true`.
+  - **Unchain** long-form Chinese narration — `POST /tts`, tone stable across a
+    whole video.
+
+  Conventions:
+  - Engine choice is a property of the deployed server, not of the caller. A
+    voice is registered under an engine; requests route to it.
+  - Model ids and tuning constants come from `POLYTTS_*` / engine-specific env
+    vars, never hardcoded in a tool or client.
+  - Sibling repo: polyasr (speech-to-text) shares the same GPU and the same
+    idle-evict discipline.
+
+# Per-artifact rules
+rules:
+  proposal:
+    - Always include a "Non-goals" section.
+    - State which runtime path (manager / MLX) the change targets.
+    - Quality claims about an engine must name the benchmark or the measurement
+      host; a vendor's headline number is not evidence about our hardware.
+  spec:
+    - Capabilities map to the server's stable surfaces (engine registry, voice
+      cloning, streaming synthesis), not to individual models.
+    - A requirement about an engine must hold for every engine, or say which one
+      it is scoped to and why.
+  tasks:
+    - Name the file each task edits.
+    - Any task that changes VRAM behaviour states the measured footprint.
