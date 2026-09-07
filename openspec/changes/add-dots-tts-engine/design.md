@@ -171,12 +171,29 @@ resampling in the server.
 
 ## Open questions — decisions for a human, not for the implementer
 
-1. **Should the VoxAlert packs move to continuation mode?** The data says
-   continuation is where dots.tts wins (0.838 vs 0.762 vs today's 0.754). The
-   reason they are x-vector-only is a *VoxCPM* artifact — in-context cloning a
-   synthetic clip copied its machine cadence. Whether dots.tts reproduces that
-   artifact is an audible judgement, not a cosine one. A/B clips exist from the
-   survey run; this must be listened to before any pack is re-registered.
+1. **Should the packs move to continuation mode?** — **MEASURED, still a human
+   call.** All 10 benchday narration packs were rendered three ways through the
+   live server and scored against their own reference clips (Resemblyzer cosine):
+
+   | | mean similarity | beats today | RTF |
+   |---|---|---|---|
+   | VoxCPM (today) | 0.860 | — | 0.53 – 0.59 |
+   | dots, x-vector (today's clone mode) | **0.762** | **0 / 10** | 0.22 – 0.23 |
+   | dots, continuation | **0.871** | **8 / 10** | 0.24 – 0.34 |
+
+   So a straight engine swap in the *existing* clone mode is a regression on
+   every pack, and the survey's "wash" reading (0.762 vs 0.754, one VoxAlert
+   voice) does not hold against a proper warm VoxCPM baseline. Continuation is
+   the only mode where the switch pays.
+
+   Two packs do not come along:
+   - **hl-hev-suit** — continuation returns **0.16 s of audio**. A failed
+     generation, not a worse voice. 30 s reference, 289-char transcript.
+   - **sc2-protoss-advisor** — 0.911 against 0.945. Small but real.
+
+   The remaining judgement is audible, not numeric: cosine says "close to the
+   reference speaker", not "right for the character". Clips:
+   <https://claude.ai/code/artifact/7f7d0798-3acc-4b17-87e5-6839ae14f87a>
 2. **Is the community MLX port good enough for xc-mac-studio?**
    `sb1992/dots-tts-mlx` v0.5.1 has streaming, int4/int8 weights and a reference
    "enrolment" cache, but is unofficial and does not document x-vector-only mode
