@@ -14,10 +14,14 @@ Engines:
   - VoxcpmEngine : VoxCPM2, voices = reference clip (timbre) + optional tone
                    seed (prompt). Voice state is just file paths -> no GPU
                    tensors to juggle across eviction.
+  - DotsEngine   : dots.tts, voices = reference clip (+ ref_text in continuation
+                   mode). No tone seed. Also file-path-only voice state.
+  - CosyvoiceEngine : CosyVoice 3 via a sidecar process (own torch pin).
 """
 import os
 import gc
 import io
+import hashlib
 import time
 import threading
 from pathlib import Path
@@ -216,6 +220,111 @@ class VoxcpmEngine(Engine):
         ck = self._clone_kwargs(voice_dir, meta, gen_kwargs)
         for chunk in self._model.generate_streaming(text=text, **ck):
             yield np.asarray(chunk, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# dots.tts engine
+# ---------------------------------------------------------------------------
+class DotsEngine(Engine):
+    """dots.tts — fully-continuous AR TTS (Qwen2.5-1.5B backbone + a flow-matching
+    DiT head over a 48 kHz AudioVAE, with a frozen CAM++ speaker x-vector as a
+    side input). Voice state is file paths only, like VoxCPM.
+
+    Two cloning paths, and which one a voice gets is DECLARED by its meta, never
+    inferred: ``x_vector_only_mode`` -> timbre embedding alone (prompt audio, no
+    transcript); otherwise *continuation*, which additionally feeds ``ref_text``
+    as ``prompt_text``. The two measure materially differently on our own voices
+    (0.838 vs 0.762 speaker similarity on a VoxAlert pack), so this engine must
+    not quietly substitute one for the other — a silent downgrade surfaces months
+    later as "the voice sounds different now". See
+    openspec/changes/add-dots-tts-engine/design.md.
+    """
+    name = "dots"
+    sample_rate = 48000
+
+    def __init__(self):
+        self._rt = None
+        self.model_name = os.environ.get("POLYTTS_DOTS_MODEL", "dots-studio/dots.tts-mf")
+        # NFE 4 + optimize=True are LOAD-BEARING, not tuning. The MeanFlow
+        # checkpoint ships no `sampling` block, so the library falls back to
+        # (euler, 10 steps, cfg 1.2) — at which these same weights measured
+        # RTF 1.81-2.02 on an RTX 3090, i.e. SLOWER THAN REAL TIME, against
+        # 0.23-0.37 at 4 steps with optimize=True. Do not "simplify" these
+        # constants away: at the library defaults this engine reads as a
+        # regression and the result is buried.
+        self._steps = int(os.environ.get("POLYTTS_DOTS_NUM_STEPS", "4"))
+        self._optimize = os.environ.get("POLYTTS_DOTS_OPTIMIZE", "1").lower() not in ("0", "false", "no")
+
+    @property
+    def loaded(self) -> bool:
+        return self._rt is not None
+
+    def load(self):
+        from dots_tts.runtime import DotsTtsRuntime
+        print(f"[dots] loading {self.model_name} (steps={self._steps}, "
+              f"optimize={self._optimize}) …", flush=True)
+        self._rt = DotsTtsRuntime.from_pretrained(
+            self.model_name, precision="bfloat16", optimize=self._optimize)
+        self.sample_rate = int(self._rt.sample_rate)
+        # from_pretrained stages the checkpoint through host memory before the
+        # warm model lands on CUDA; hand those pages back without unloading the
+        # GPU-resident model (same reclaim as voxcpm).
+        gc.collect()
+        _trim_ram()
+        print(f"[dots] loaded. sr={self.sample_rate}", flush=True)
+
+    def unload(self):
+        # Voice state is file paths only -> nothing GPU-resident to drop.
+        self._rt = None
+        gc.collect()
+        _free_cuda()
+        _trim_ram()
+        print("[dots] unloaded.", flush=True)
+
+    def _clone_kwargs(self, voice_dir: Path, meta: dict, language) -> dict:
+        """reference clip = timbre; ref_text = the transcript the model continues
+        from, in continuation mode only.
+
+        VoxCPM/Qwen per-request knobs (cfg_value, inference_timesteps,
+        temperature, ...) are deliberately NOT forwarded. They are differently
+        scaled here — VoxCPM's cfg_value 3.3 against dots' guidance_scale 1.2 —
+        so passing them through would change quality under a name that means
+        something else on this engine.
+        """
+        kw = dict(prompt_audio_path=str(voice_dir / "voice.wav"),
+                  num_steps=self._steps)
+        if not meta.get("x_vector_only_mode", False):
+            kw["prompt_text"] = meta["ref_text"]
+        if language:
+            # normalize_language_code() accepts our qwen-style names ("Chinese",
+            # "English") via langcodes and returns None for anything it cannot
+            # resolve, so an unknown language degrades to auto-detect.
+            kw["language"] = language
+        return kw
+
+    def _seed(self, voice_id: str):
+        """dots.tts draws its flow-matching noise from the GLOBAL torch RNG and
+        exposes no seed argument, so a repeat of the same (text, voice) would
+        otherwise differ byte-for-byte — which the /tts/stream disk PCM cache
+        assumes it does not. Pin the RNG per voice before every generation.
+
+        This is an RNG seed, not a tone lock: the engine has no tone-seed input,
+        so VoxCPM's `seed.wav` / `seed_text` have no meaning here and are ignored.
+        """
+        import torch
+        torch.manual_seed(int(hashlib.sha256(voice_id.encode()).hexdigest()[:8], 16))
+
+    def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        self._seed(voice_id)
+        out = self._rt.generate(text=text, **self._clone_kwargs(voice_dir, meta, language))
+        audio = out["audio"].detach().float().cpu().numpy().reshape(-1)
+        return np.asarray(audio, dtype=np.float32), int(out.get("sample_rate", self.sample_rate))
+
+    def stream(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        self._seed(voice_id)
+        for chunk in self._rt.generate_stream(
+                text=text, **self._clone_kwargs(voice_dir, meta, language)):
+            yield chunk.detach().float().cpu().numpy().reshape(-1)
 
 
 # ---------------------------------------------------------------------------

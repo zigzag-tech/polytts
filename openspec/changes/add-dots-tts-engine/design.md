@@ -57,9 +57,27 @@ would have read as a regression and buried the result. The engine therefore sets
 both explicitly rather than inheriting them, and `design`-level intent is
 recorded in a comment next to the constant.
 
-`optimize=True` compiles at load, so first-load is slower. This is acceptable
-because the manager loads lazily and idle-evicts on a long timer; it is the same
-trade the CUDA graph path already makes elsewhere.
+`optimize=True` compiles at load, so first-load is slower. **Measured, this is
+much larger than "slower":**
+
+| Load | Elapsed |
+|---|---|
+| First ever on the host (cold inductor cache) | **362 s** |
+| With a populated inductor cache | **38 – 65 s** |
+| VoxCPM, for comparison | ~54 s (~110 s under compile) |
+
+Nearly all of the 362 s is `torch.compile` codegen, and inductor caches it on
+disk — so the cost is paid **once per host**, not once per restart, *provided the
+cache outlives a reboot*. Its default location is under `/tmp`, which is exactly
+where it does not outlive one. `TORCHINDUCTOR_CACHE_DIR` is therefore pinned to
+`~/.cache/torchinductor-polytts` in the polytts systemd drop-in; without that, the
+6-minute compile returns on every boot, and the server preloads
+`POLYTTS_DEFAULT_ENGINE` **synchronously at startup**, so it is paid before the
+port answers.
+
+The cache is portable between processes on the same host: seeding the persistent
+directory from a previous run's `/tmp` cache cut the next load from 362 s to 94 s
+without any other change.
 
 ## Decision: clone mode is engine-declared, not inferred
 
@@ -111,14 +129,38 @@ capability the engine does not have.
 
 ## Decision: footprint and residency
 
-`_FOOTPRINTS["dots"] = 6_500_000_000`, from the measured peak of 5.4 – 6.4 GB
-(6.4 GB on the 45 s long-form request, the worst case measured). Rounded up, not
-down: the planner uses this to decide whether a unit fits, and under-reporting
-produces exactly the OOM that killed the SOAR run.
+`_FOOTPRINTS["dots"] = 8_000_000_000`.
+
+**Corrected during implementation, from 6.5 GB.** The survey's 5.4 – 6.4 GB was
+measured in x-vector mode. Serving *continuation* against a 60 s reference clip
+(687-char `ref_text`) the same checkpoint reserved **7.6 GB** on an RTX 3090, and
+an intermediate run OOM'd at 7.1 GB on a card with ~7.7 GB free. The peak is set
+by the **longest registered reference clip**, because continuation encodes the
+prompt audio in full while the x-vector path truncates it at
+`xvec_max_audio_seconds = 10`. benchday's own narration packs hold references
+from 8 s to 60 s, so the long tail is not hypothetical.
+
+8 GB is 7.6 GB rounded up. Do not tune it down to the tidier x-vector number:
+this change's own rule — that under-reporting a footprint is what disqualified
+SOAR — was violated by the first estimate, and the OOM followed.
 
 Residency policy follows the existing rule — `SOFT_PIN` only if `dots` is
-`DEFAULT_ENGINE`, otherwise `UNPINNED`. This change does **not** move
+`DEFAULT_ENGINE`, otherwise `UNPINNED`. The change itself does not move
 `POLYTTS_DEFAULT_ENGINE`; that is a deployment decision per host.
+
+**But that deployment decision dominates the latency, and it is not a tuning
+knob.** With `POLYTTS_DEFAULT_ENGINE=voxcpm`, the residency planner restores the
+soft-pinned voxcpm the instant a dots synthesis completes, so the *next* dots
+request reloads the model: measured **115 s wall for an 11.2 s phrase whose
+generation took 2.46 s**. With `POLYTTS_DEFAULT_ENGINE=dots` the same phrase is
+2.3 s. A host that serves dots voices and does not pin dots is not running a slow
+engine — it is paying a model load per request, and the fix is the pin, not the
+sampling config.
+
+The converse cost is real and belongs in the deployment note: with dots pinned,
+the first `voxcpm` or `qwen` request on that host pays the eviction and a cold
+load (measured **89 s** for voxcpm), after which the planner restores dots (38 s).
+On a host shared with Voxlert, which uses voxcpm, that is a per-switch tax.
 
 ## Sample rate
 
@@ -149,7 +191,27 @@ resampling in the server.
   registration-time check above catches *empty*, not *wrong*.
 - **torch pairing.** `dots.tts` fails at import when torch and torchaudio minor
   versions differ. Installing it into an existing venv can silently upgrade torch
-  and break the pair; it must be installed against the venv's existing torch.
+  and break the pair.
+
+  **Implementation found this stronger than written.** The deployed venv on
+  xc-tower-ubuntu held `torch 2.14.0+cu130` against `torchaudio 2.11.0+cu130`, and
+  torchaudio has **no** cu130 build past 2.11 — so "install against the venv's
+  existing torch" was not available: the pair could only be matched by pinning
+  torch *down* to 2.11.0. `requirements-pytorch.txt` therefore pins **both**
+  (`torch==2.11.0`, `torchaudio==2.11.0`) instead of floating them, and `setup.sh`
+  asserts the pair at install time — because the drift is silent everywhere else
+  in this venv and surfaces only as "the dots voices 503".
+
+  Verified on a copy of the deployed venv before the deployed one was touched:
+  torch 2.11.0 still imports and runs `voxcpm`, `qwen_tts` and `torchcodec`.
+  dots.tts additionally pulls `numpy>=2`, which trips funasr's declared `numpy<2`;
+  funasr imports and runs on numpy 2.5.3, so that `pip check` conflict is expected
+  rather than a break.
+
+  (The related suspicion that this venv's `torchaudio.lib._torchaudio` C extension
+  was broken by the mismatch is **wrong** and should not be chased: torchaudio
+  2.9+ ships no such extension at all — it delegates to torchcodec. The module is
+  absent on a matched pair too.)
 - **First-load latency.** `optimize=True` compiles at load. On a cold engine the
   first request pays for it; the manager's idle timer decides how often that
   happens.

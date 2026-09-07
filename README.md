@@ -133,7 +133,8 @@ POLYTTS_RUNTIME=pytorch POLYTTS_MODEL=0.6B ./run.sh
 On any non-MLX runtime the server runs a **multi-engine manager** that keeps **at
 most one model in VRAM at a time** — built for GPUs shared with other workloads.
 
-- **Engines:** `qwen` (Qwen3-TTS) and `voxcpm` (VoxCPM2). Models load **lazily** on
+- **Engines:** `qwen` (Qwen3-TTS), `voxcpm` (VoxCPM2), `dots` (dots.tts) and
+  `cosyvoice` (CosyVoice 3, sidecar). Models load **lazily** on
   first use; switching engines unloads the previous one; the resident model is
   also **evicted after `POLYTTS_IDLE_EVICT_SECONDS`** of inactivity, returning
   VRAM to the driver. `GET /health` reports the resident engine and live VRAM.
@@ -144,6 +145,23 @@ most one model in VRAM at a time** — built for GPUs shared with other workload
   optional **tone seed** (`seed_audio` + `seed_text` on `POST /voices`). Every
   generation continues that locked tone, so prosody stays consistent across a
   long video instead of drifting per sentence. Output is 48 kHz.
+- **dots.tts voices & clone mode:** a dots voice is a reference clip, and
+  `x_vector_only_mode` picks which of two *materially different* cloning paths it
+  uses — timbre embedding alone (`true`), or **continuation** (`false`), which
+  also conditions on `ref_text`. Continuation measured clearly better on our own
+  voices (0.838 vs 0.762 speaker similarity on a game-audio reference, against
+  0.754 for the same reference under VoxCPM), so do **not** inherit VoxCPM's
+  x-vector-only guidance here without re-measuring: under VoxCPM that flag exists
+  to stop in-context cloning from copying a synthetic clip's machine cadence, and
+  the trade-off is not the same engine to engine. A continuation registration
+  with an empty `ref_text` is **rejected at registration** (400) rather than
+  silently downgraded. Output is 48 kHz.
+- **dots.tts has NO tone seed.** One prompt carries both timbre and prosody, and
+  the library's `seed` is an RNG seed that *varies* prosody rather than locking
+  it. `seed.wav` / `seed_text` are therefore **ignored** under this engine (the
+  fields stay in `meta.json` for voices that have them, with no effect). The
+  engine pins the RNG per voice instead, so repeat synthesis of the same text is
+  byte-identical — which the `/tts/stream` disk PCM cache assumes.
 - **Requires Python <3.13** (VoxCPM constraint). The MLX path is unaffected.
 
 ```bash
@@ -164,6 +182,9 @@ POLYTTS_RUNTIME=pytorch POLYTTS_IDLE_EVICT_SECONDS=120 ./run.sh
 | `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HuggingFace model ID for the VoxCPM engine |
 | `VOXCPM_CFG_VALUE` | `3.3` | VoxCPM guidance scale |
 | `VOXCPM_TIMESTEPS` | `10` | VoxCPM diffusion inference steps |
+| `POLYTTS_DOTS_MODEL` | `dots-studio/dots.tts-mf` | HuggingFace model ID for the dots.tts engine |
+| `POLYTTS_DOTS_NUM_STEPS` | `4` | dots.tts flow-matching steps (NFE). **Load-bearing:** the MeanFlow checkpoint ships no sampling block, so the library default is 10 — at which the same weights measured RTF 1.81–2.02 (slower than real time) on an RTX 3090, against 0.23–0.37 at 4 |
+| `POLYTTS_DOTS_OPTIMIZE` | `1` | Compile the dots.tts runtime at load (`torch.compile`). Slower first load, needed for the RTF above |
 
 ## API endpoints
 

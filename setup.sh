@@ -111,6 +111,22 @@ from qwen_tts import Qwen3TTSModel; print('  qwen_tts OK')
 import soundfile; print('  soundfile OK')
 import fastapi; print('  fastapi OK')
 "
+
+# The dots engine is import-fragile in one specific way: dots.tts refuses to load
+# when torch and torchaudio disagree on their MINOR version, and nothing else in
+# this venv cares, so the drift only shows up as "the dots voices 503". Assert the
+# pair HERE, at install time, rather than letting it surface at first synthesis.
+# Not fatal — a box that only serves qwen/voxcpm is still a working polytts.
+if [[ "$arch" != "arm64" || "$(uname -s)" != "Darwin" ]]; then
+    "$VENV_PYTHON" -c "
+import torch, torchaudio
+tm = torch.__version__.split('+')[0].rsplit('.', 1)[0]
+am = torchaudio.__version__.split('+')[0].rsplit('.', 1)[0]
+assert tm == am, f'torch {torch.__version__} / torchaudio {torchaudio.__version__} minors differ — dots.tts will not import'
+import dots_tts.runtime  # noqa: F401
+print('  dots_tts OK (torch/torchaudio pair matched)')
+" || warn "dots.tts is not importable in this venv — the 'dots' engine will fail; qwen/voxcpm/cosyvoice are unaffected. Check that torch and torchaudio share a minor version."
+fi
 if [[ "$arch" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
     "$VENV_PYTHON" -c "
 import mlx.core; print(f'  mlx {mlx.core.__version__}')

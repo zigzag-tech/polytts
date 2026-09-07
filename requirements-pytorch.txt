@@ -1,7 +1,21 @@
 # PyTorch backend (CUDA / MPS / CPU)
-torch>=2.10.0
-torchaudio>=2.10.0
+#
+# torch and torchaudio MUST share a minor version. dots.tts checks the pair at
+# IMPORT and raises RuntimeError when they differ, so a floating torch takes the
+# dots engine out while every other engine keeps working — which reads in the
+# logs as "dots is broken", not "the pin drifted". torchaudio's newest cu130
+# build is 2.11.0, so torch is pinned down to match rather than floating to the
+# newest (2.14). Bump BOTH together or not at all.
+torch==2.11.0
+torchaudio==2.11.0
 qwen-tts>=0.1.1
 
 # VoxCPM engine (multi-engine manager path). Requires Python <3.13.
 voxcpm>=2.0.3
+
+# dots.tts engine. MUST be installed after torch — its own `torch>=2.8.0` will
+# happily resolve a newer torch and break the pair above. It also pulls numpy>=2
+# while funasr (a voxcpm dependency) declares numpy<2; funasr imports and runs on
+# numpy 2.5 — verified on the deployment host, not assumed — so `pip check` will
+# report that one conflict and it is expected.
+dots.tts==0.3.1

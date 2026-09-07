@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, pcm16
+from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -43,6 +43,11 @@ RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 _MANAGER_PATH = RUNTIME != "mlx"
 IDLE_EVICT_SECONDS = int(os.environ.get("POLYTTS_IDLE_EVICT_SECONDS", "120"))
 DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
+
+# Engines whose non-x-vector cloning path consumes the reference TRANSCRIPT,
+# so a blank ref_text cannot serve it. cosyvoice is absent deliberately: its
+# sidecar passes ref_text straight through and tolerates an empty one.
+_NEEDS_REF_TEXT = frozenset({"qwen", "dots"})
 
 # Cap in-memory voice caches so that registering thousands of unique voices
 # cannot grow memory without bound.  Evicted voices remain on disk and are
@@ -126,7 +131,18 @@ if _MANAGER_PATH:
     from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda
 
     # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
-    _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000, "cosyvoice": 3_000_000_000}
+    # `dots` is MEASURED, not estimated, and the number is driven by the CLONE
+    # MODE, not by the engine: on an RTX 3090 the same checkpoint reserved
+    # 6.3 GB serving an x-vector voice and 7.6 GB serving continuation against a
+    # 60 s reference clip (687-char ref_text) — the prompt audio is encoded in
+    # full on that path, so the longest registered reference sets the peak. 8 GB
+    # is the 7.6 GB worst case rounded UP. Do not tune this down to the pretty
+    # x-vector number: the planner sizes eviction from it, an earlier 6.5 GB
+    # guess OOM'd mid-synthesis at 7.1 GB, and under-reporting is the same defect
+    # that disqualified the heavier dots.tts-soar checkpoint beside polyasr.
+    # See openspec/changes/add-dots-tts-engine.
+    _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
+                   "cosyvoice": 3_000_000_000, "dots": 8_000_000_000}
 
     def _engine_unit(name, engine, pin):
         def loader():
@@ -143,7 +159,8 @@ if _MANAGER_PATH:
                            residency_policy=(ResidencyPolicy.SOFT_PIN if pin
                                              else ResidencyPolicy.UNPINNED))
 
-    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(), "cosyvoice": CosyvoiceEngine()}
+    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
+                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()}
     _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
 
     def _gpu_call(fn):
@@ -900,8 +917,22 @@ async def upload_voice(
         return {"voice_id": voice_id}
 
     # ----- Manager path -----
-    if engine not in ("qwen", "voxcpm", "cosyvoice"):
+    # Validated against the live registry, not a hand-copied tuple — a list here
+    # rots the moment an engine is added and rejects it as "unknown".
+    if engine not in _ENGINES:
         raise HTTPException(400, f"Unknown engine: {engine}")
+    # Continuation cloning needs the reference transcript. An engine that cannot
+    # clone without one must FAIL the registration rather than fall back to its
+    # x-vector path: a silent downgrade produces a voice that sounds wrong months
+    # later with nothing in the logs to say why. Checked BEFORE any directory is
+    # created, so a rejected registration leaves nothing behind.
+    if engine in _NEEDS_REF_TEXT and not x_vector_only_mode and not ref_text.strip():
+        raise HTTPException(
+            400,
+            f"engine '{engine}' clones by continuation when x_vector_only_mode is "
+            f"false, and that requires a non-empty ref_text (the transcript of the "
+            f"reference clip). Supply ref_text, or register with "
+            f"x_vector_only_mode=true to clone from timbre alone.")
     seed_bytes = await seed_audio.read() if seed_audio is not None else b""
 
     # Content-hash so identical (audio, engine, mode, seed) dedupes to one id.
@@ -1309,6 +1340,13 @@ def health():
             info["device"] = "cpu"
         info["manager"] = manager.status() if manager else None
         info["model"] = sorted(manager.resident) if manager else None
+        # Which CHECKPOINT each resident engine actually loaded. The engine NAME
+        # cannot answer "did POLYTTS_DOTS_MODEL / VOXCPM_MODEL_ID take effect?",
+        # and a server quietly running a different checkpoint than the operator
+        # set is otherwise invisible until somebody listens to the output.
+        info["checkpoint"] = ({n: getattr(_ENGINES[n], "model_name", None)
+                               for n in sorted(manager.resident) if n in _ENGINES}
+                              if manager else None)
         info["voices"] = sorted(voice_registry.keys())
         info["wav_cache_entries"] = len(cache._store)
 
