@@ -130,6 +130,41 @@ HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0
 if _MANAGER_PATH:
     from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda
 
+    # A PyTorch runtime with no accelerator is not a slow TTS server; it is a
+    # broken one that nothing downstream can detect.
+    #
+    # Measured: xc-tower-ubuntu ran this service for a week reporting
+    # `"device": "cpu"` on a box with two RTX 3090s. torch decides
+    # `cuda.is_available()` once, at import, so a process that starts while the
+    # driver is reloading keeps that answer until it is restarted — and every
+    # engine it loads afterwards goes to system memory. Nothing failed. The
+    # residency manager warmed models, leases were granted, syntheses returned,
+    # and each one took an order of magnitude longer than it should have. The
+    # only symptom was a field in /health that nobody reads.
+    #
+    # Harmony loads and unloads MODELS; it cannot repair a PROCESS that has
+    # decided there is no GPU. Refusing to start is what makes that visible, at
+    # the one moment somebody is watching — a failed unit — instead of at the
+    # worst one, which is never.
+    #
+    # `POLYTTS_ALLOW_CPU=1` is the escape hatch, for a box that genuinely has
+    # no accelerator and wants a slow server on purpose.
+    import torch as _torch_probe
+
+    _has_cuda = _torch_probe.cuda.is_available()
+    _mps = getattr(_torch_probe.backends, "mps", None)
+    _has_mps = bool(_mps and _mps.is_available())
+    if not _has_cuda and not _has_mps and os.environ.get("POLYTTS_ALLOW_CPU") != "1":
+        raise SystemExit(
+            f"polytts: POLYTTS_RUNTIME={RUNTIME} needs CUDA or MPS and torch sees neither "
+            f"(torch {_torch_probe.__version__}, cuda build {_torch_probe.version.cuda}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}). "
+            "A CPU synthesis is ~10x slower and reports success, so this refuses to start "
+            "rather than serve it. If the GPU is there, the driver was probably not ready "
+            "when this process began: restart the unit. If this box has no accelerator, set "
+            "POLYTTS_ALLOW_CPU=1."
+        )
+
     # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
     # `dots` is MEASURED, not estimated, and the number is driven by the CLONE
     # MODE, not by the engine: on an RTX 3090 the same checkpoint reserved
@@ -1353,5 +1388,44 @@ def health():
     return info
 
 
+def _refuse_if_port_taken() -> None:
+    """A port already in use is a failure, and uvicorn reports it as success.
+
+    Measured on xc-mac-studio: two instances raced, the loser logged
+    `[Errno 48] address already in use`, shut down gracefully and **exited 0**.
+    `run.sh` reads exit 0 as "server exited cleanly", breaks its restart loop,
+    and leaves the launchd job holding a wrapper with no server inside it.
+    launchd saw a healthy job; the fleet saw the node `mia` with
+    `Connection refused` — for forty-six hours.
+
+    Checked before uvicorn starts, so the exit code says what happened. There
+    is a race between this probe and the bind; it does not matter, because the
+    bind failure after it is the same non-zero exit, which is all `run.sh`
+    needed in the first place.
+    """
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Deliberately NOT SO_REUSEADDR: the question is "is somebody serving
+    # here", and the option exists to make that question answer no.
+    try:
+        probe.bind(("0.0.0.0", PORT))
+    except OSError as exc:
+        import errno as _errno
+
+        what = ("another process is already serving it"
+                if exc.errno == _errno.EADDRINUSE
+                else "this process cannot bind it")
+        raise SystemExit(
+            f"polytts: port {PORT} is unavailable — {what} ({exc}). "
+            f"Check `lsof -nP -iTCP:{PORT} -sTCP:LISTEN`. Refusing to start: a second "
+            "instance exits 0 after its failed bind, and every supervisor above reads "
+            "that as a clean shutdown."
+        )
+    finally:
+        probe.close()
+
+
 if __name__ == "__main__":
+    _refuse_if_port_taken()
     uvicorn.run(app, host="0.0.0.0", port=PORT)
