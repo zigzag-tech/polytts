@@ -17,6 +17,7 @@ import json
 import hashlib
 import asyncio
 import concurrent.futures
+import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -210,7 +211,9 @@ if _MANAGER_PATH:
         # what we listen on), and we already have it right here.
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
-                                    gpu_call=_gpu_call, port=PORT)
+                                    gpu_call=_gpu_call, port=PORT,
+                                    # After the bind, never before: see startup().
+                                    preload=lambda: _warm_manager_path())
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
@@ -261,7 +264,9 @@ elif RUNTIME == "mlx":
         from livestack_node import attach
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
-                                    coload=True, gpu_call=_gpu_call, port=PORT)
+                                    coload=True, gpu_call=_gpu_call, port=PORT,
+                                    # After the bind, never before: see startup().
+                                    preload=lambda: _warm_mlx())
     except ImportError:
         manager = None
         residence = None
@@ -845,30 +850,63 @@ def _resolve_engine(req_engine, voice_id):
 # FastAPI
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
+def _warm_mlx() -> None:
+    """Load what MLX serving needs. Runs AFTER the port is bound — see below."""
+    global manager
+    if manager is not None:
+        manager.ensure("qwen")
+    else:
+        _load_mlx()
+    _load_voices_mlx()
+    # Pre-load the voxcpm model when voxcpm voices exist so the first request
+    # isn't slow. Never fail the warm if it can't load.
+    if _mlx_voxcpm_voices:
+        try:
+            _load_voxcpm_mlx()
+        except Exception as e:
+            print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
+
+
+def _warm_manager_path() -> None:
+    """Load the pinned default engine on the GPU executor."""
+    _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
+
+
 async def startup():
     global manager
+
+    # **Nothing that loads a model happens here any more, and the reason is a
+    # deadlock rather than a preference.**
+    #
+    # A FastAPI startup hook runs BEFORE uvicorn binds. A load in here means the
+    # port stays closed until it finishes, so the broker cannot snapshot this
+    # node, so it never learns this process hosts `polytts` — and `admit` for an
+    # unknown kind is a refusal, by design, because a refusal and an outage must
+    # not look alike. `manager.ensure` then waits for a grant that cannot come.
+    #
+    # Measured on xc-mac-studio, 2026-09-18: the local broker answered
+    # `defer polytts-708943429 (unknown kind)` and this process sat with no
+    # listener, no open sockets and no CPU. The fleet showed `mia`,
+    # `Connection refused`, for forty-six hours — and a restart landed straight
+    # back in it.
+    #
+    # `attach(preload=...)` warms after the facade answers, which is the only
+    # place the cycle can be broken: bound, then announced, then snapshotted,
+    # then warmed. While it warms the node reports `ready: false`, which the
+    # fleet view models and the ranker filters on, so an unwarmed node is not
+    # chosen rather than chosen and slow.
     if RUNTIME == "mlx":
-        # Load the HARD_PIN qwen unit through the manager (registers residency
-        # with the broker); direct load if no manager is wired.
-        if manager is not None:
-            manager.ensure("qwen")
-        else:
-            _load_mlx()
-        _load_voices_mlx()
-        # Pre-load the voxcpm model when voxcpm voices exist so the first
-        # request isn't slow. Never fail startup if it can't load.
-        if _mlx_voxcpm_voices:
-            try:
-                _load_voxcpm_mlx()
-            except Exception as e:
-                print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
+        if manager is None:
+            # No livestack: nobody will warm this for us, and there is no
+            # arbitration to deadlock against either. Own thread, so the bind
+            # still happens now.
+            threading.Thread(target=_warm_mlx, name="polytts-warm", daemon=True).start()
         return
 
-    # Manager path: manager + residency were wired by attach() at import. Preload
-    # the pinned default engine (benchday needs it hot) and start the idle sweep,
-    # which calls manager.maybe_evict() -> coordinator.idle_sweep().
     _scan_voice_registry()
-    _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
+    if manager is not None and residence is None:
+        # Same case on the manager path: no livestack attach, no preload hook.
+        threading.Thread(target=_warm_manager_path, name="polytts-warm", daemon=True).start()
 
     async def _idle_loop():
         loop = asyncio.get_running_loop()
