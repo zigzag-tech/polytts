@@ -849,7 +849,6 @@ def _resolve_engine(req_engine, voice_id):
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
 def _warm_mlx() -> None:
     """Load what MLX serving needs. Runs AFTER the port is bound — see below."""
     global manager
@@ -872,6 +871,7 @@ def _warm_manager_path() -> None:
     _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
 
 
+@app.on_event("startup")
 async def startup():
     global manager
 
