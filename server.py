@@ -1143,7 +1143,17 @@ def _gen_chunks(engine_name, req):
 
 @app.post("/tts")
 async def tts(req: TTSRequest):
-    language = req.language or "Chinese"
+    # `_lang_name`, exactly as the streaming path below does it. This one took
+    # the field raw, so the ISO code every other surface accepts — the phone
+    # sends `en`, and so does anything that speaks BCP-47 — reached the engine
+    # unmapped and came back a 500: `Unsupported languages: ['en']. Supported:
+    # ['auto', 'chinese', 'english', ...]`. Measured 2026-09-18 on the first
+    # English synthesis this fleet ever asked for. One request shape working on
+    # one endpoint and 500ing on the other is not a language problem.
+    #
+    # The default stays Chinese here (the streaming path defaults to English
+    # for terminal content); only the MAPPING is shared.
+    language = _lang_name(req.language or "Chinese")
     gen_kwargs = _generation_kwargs(req)
     non_streaming_mode = req.non_streaming_mode if req.non_streaming_mode is not None else False
     loop = asyncio.get_running_loop()
