@@ -144,6 +144,8 @@ if _MANAGER_PATH:
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
                    "cosyvoice": 3_000_000_000, "dots": 8_000_000_000}
 
+    _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
+
     def _engine_unit(name, engine, pin):
         def loader():
             engine.load()
@@ -154,10 +156,17 @@ if _MANAGER_PATH:
         # Default engine is SOFT_PIN: preferred-warm but PREEMPTIBLE under GPU
         # pressure (e.g. an ASR/align burst) — the residence planner restores it
         # when pressure settles. The other engine is pure demand (UNPINNED).
+        #
+        # POLYTTS_DEFAULT_RESIDENCY overrides the default engine's policy per
+        # host, because "keep TTS hot" is a claim about a machine, not about
+        # this code. On a box whose GPUs are also serving LLMs, a pinned 5 GB
+        # engine can be the reason a model that IS being asked for has nowhere
+        # to go — SOFT_PIN only yields to something strictly more important, so
+        # an idle engine outranks live demand. Unset, behaviour is unchanged.
         return ManagedUnit(name, loader, freer,
                            footprint=_FOOTPRINTS.get(name, 0),
-                           residency_policy=(ResidencyPolicy.SOFT_PIN if pin
-                                             else ResidencyPolicy.UNPINNED))
+                           residency_policy=(getattr(ResidencyPolicy, _DEFAULT_RESIDENCY)
+                                             if pin else ResidencyPolicy.UNPINNED))
 
     _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
                 "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()}
@@ -173,9 +182,15 @@ if _MANAGER_PATH:
         # its own — no LIVESTACK_PEERS entry, no broker restart. It is the one
         # fact the broker cannot infer (a POST shows it our source address, not
         # what we listen on), and we already have it right here.
+        # `in_flight` is this server's OWN count of concurrent syntheses — the
+        # admission-control counter `_inflight` defined below, read lazily. A
+        # synthesis does not take a livestack lease, so the facade's lease-derived
+        # fallback would report 0 while the GPU thread is saturated; supplying it
+        # here also gets the report labelled `in_flight_source: "server"`.
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
-                                    gpu_call=_gpu_call, port=PORT)
+                                    gpu_call=_gpu_call, port=PORT,
+                                    in_flight=lambda: _inflight)
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
@@ -226,7 +241,8 @@ elif RUNTIME == "mlx":
         from livestack_node import attach
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
-                                    coload=True, gpu_call=_gpu_call, port=PORT)
+                                    coload=True, gpu_call=_gpu_call, port=PORT,
+                                    in_flight=lambda: _inflight)
     except ImportError:
         manager = None
         residence = None

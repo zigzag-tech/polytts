@@ -74,6 +74,39 @@ if [[ "$arch" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 echo "  Done."
 
+# ── Livestack residency manager (polycore + shared_py) ───────────────────────
+# On the PyTorch/CUDA runtime the server REQUIRES the polycore residency seam and
+# its compiled shared_py planner (server.py: `_MANAGER_PATH = RUNTIME != "mlx"`,
+# which imports `polycore` at module load). Both live in the livestack monorepo.
+# Install them EDITABLE so the venv resolves them by package name at their current
+# location — never a hardcoded path that goes stale when the repo moves. (The old
+# breakage was a hand-written polycore.pth pointing at a since-moved directory.)
+# Skipped under MLX (Apple Silicon), which runs the standalone residency path.
+install_livestack_residency() {
+    if [[ "$arch" == "arm64" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "  MLX runtime — standalone residency; polycore not required."
+        return
+    fi
+    local LIVESTACK_DIR="${LIVESTACK_DIR:-$HOME/livestack}"
+    if [[ ! -d "$LIVESTACK_DIR/polycore" ]]; then
+        warn "polycore not found under LIVESTACK_DIR=$LIVESTACK_DIR — point LIVESTACK_DIR at your livestack checkout and re-run. The CUDA server cannot start without it."
+        return
+    fi
+    # Prefer uv (this venv may be uv-managed and lack pip); fall back to venv pip.
+    local INSTALL=("$VENV_PIP" install)
+    command -v uv &>/dev/null && INSTALL=(uv pip install --python "$VENV_PYTHON")
+    info "Installing livestack residency (editable) from $LIVESTACK_DIR…"
+    "${INSTALL[@]}" -e "$LIVESTACK_DIR/polycore" --no-deps
+    [[ -d "$LIVESTACK_DIR/node-py" ]] && "${INSTALL[@]}" -e "$LIVESTACK_DIR/node-py" --no-deps
+    # shared_py is a Rust/pyo3 extension — build it into THIS venv with maturin.
+    "${INSTALL[@]}" maturin
+    ( cd "$LIVESTACK_DIR/shared-py" \
+        && env -u CONDA_PREFIX VIRTUAL_ENV="$SCRIPT_DIR/venv" PYO3_PYTHON="$VENV_PYTHON" \
+           "$VENV_PYTHON" -m maturin develop --release )
+    "$VENV_PYTHON" -c "import polycore, shared_py; print('  polycore + shared_py OK')"
+}
+install_livestack_residency
+
 # ── Download models ──────────────────────────────────────────────────────────
 info "Downloading PyTorch models (used for both MPS and CUDA)…"
 mkdir -p models

@@ -184,6 +184,11 @@ class VoxcpmEngine(Engine):
         print(f"[voxcpm] loading {self.model_name} …", flush=True)
         self._model = VoxCPM.from_pretrained(self.model_name, load_denoiser=False)
         self.sample_rate = self._model.tts_model.sample_rate
+        # from_pretrained stages the full checkpoint through CPU tensors before
+        # moving the warm model to CUDA. Reclaim those now-unused host buffers
+        # without unloading the GPU-resident model.
+        gc.collect()
+        _trim_ram()
         print(f"[voxcpm] loaded. sr={self.sample_rate}", flush=True)
 
     def unload(self):

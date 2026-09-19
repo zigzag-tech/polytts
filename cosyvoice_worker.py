@@ -56,6 +56,44 @@ class TTSReq(BaseModel):
     ref_text: str = ""
     instruct: str | None = None        # emotion/style instruction, e.g. "请用温暖的语气"
     speed: float | None = None          # 0.5..2.0 (passed as part of instruct if set)
+    # Group N sentences per generation so prosody flows within a chunk, then join
+    # chunks with a controlled pause. 1 = per-sentence (choppy); large = whole-text
+    # (CosyVoice decides boundaries, can cut mid-sentence / under-pause).
+    sentences_per_chunk: int | None = None
+    interchunk_silence: float | None = None
+    # Insert a CosyVoice control token (e.g. "[breath]" / "[quick_breath]") at
+    # every within-chunk sentence boundary so the model breathes there naturally
+    # (fixes under-paused sentence ends inside multi-sentence chunks).
+    breath_token: str | None = None
+
+
+# Generate sentence-by-sentence and join with a guaranteed inter-sentence
+# silence. CosyVoice's whole-text mode groups multiple sentences per chunk and
+# hard-concat ran some sentence ends into the next with insufficient pause.
+INTERSENTENCE_SILENCE = float(os.environ.get("COSYVOICE_INTERSENTENCE_SILENCE", "0.35"))
+_SENT_ENDERS = "。！？!?\n"
+
+
+def _split_sentences(text: str):
+    out, buf = [], ""
+    for ch in text:
+        buf += ch
+        if ch in _SENT_ENDERS:
+            s = buf.strip()
+            if s:
+                out.append(s)
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out or [text]
+
+
+def _gen_one(m, text, inst, ref_text, voice_wav_path):
+    if inst:
+        prompt = f"{SYS_PREFIX}. {inst}<|endofprompt|>"
+        return m.inference_instruct2(text, prompt, voice_wav_path, stream=False)
+    prompt = f"{SYS_PREFIX}<|endofprompt|>{ref_text}"
+    return m.inference_zero_shot(text, prompt, voice_wav_path, stream=False)
 
 
 def _synth(req: TTSReq):
@@ -63,21 +101,35 @@ def _synth(req: TTSReq):
     inst = req.instruct or ""
     if req.speed:
         inst = (inst + " " if inst else "") + f"语速设为{req.speed}"
-    with _lock:  # serialize GPU access
-        if inst:
-            prompt = f"{SYS_PREFIX}. {inst}<|endofprompt|>"
-            gen = m.inference_instruct2(req.text, prompt, req.voice_wav_path, stream=False)
-        else:
-            prompt = f"{SYS_PREFIX}<|endofprompt|>{req.ref_text}"
-            gen = m.inference_zero_shot(req.text, prompt, req.voice_wav_path, stream=False)
+    sents = _split_sentences(req.text)
+    spc = req.sentences_per_chunk or int(os.environ.get("COSYVOICE_SENTENCES_PER_CHUNK", "2"))
+    gap_s = (req.interchunk_silence if req.interchunk_silence is not None
+             else float(os.environ.get("COSYVOICE_INTERCHUNK_SILENCE", "0.5")))
+    breath = req.breath_token or os.environ.get("COSYVOICE_BREATH_TOKEN", "")
+    # Pack sentences into sentence-aligned chunks (no mid-sentence cuts); insert
+    # a breath token between sentences within a chunk so every boundary breathes.
+    joiner = f"{breath}" if breath else ""
+    chunks_text = [joiner.join(sents[i:i + spc]) for i in range(0, len(sents), spc)]
+    gap = torch.zeros(int(m.sample_rate * gap_s)) if len(chunks_text) > 1 else None
+    with _lock:  # serialize GPU access across the whole multi-chunk job
         pieces = []
-        for j in gen:
-            t = j["tts_speech"]
-            if t.dim() > 1:
-                t = t.squeeze(0)
-            pieces.append(t.cpu().float())
-    audio = torch.cat(pieces).numpy() if pieces else np.zeros(0, dtype=np.float32)
-    return np.asarray(audio, dtype=np.float32), m.sample_rate
+        for ct in chunks_text:
+            seg = []
+            for j in _gen_one(m, ct, inst, req.ref_text, req.voice_wav_path):
+                t = j["tts_speech"]
+                if t.dim() > 1:
+                    t = t.squeeze(0)
+                seg.append(t.cpu().float())
+            if seg:
+                pieces.append(torch.cat(seg))
+    print(f"[cosyvoice] {len(sents)} sentences -> {len(chunks_text)} chunks "
+          f"(<= {spc}/chunk), gap={gap_s}s, breath={breath or 'none'}", flush=True)
+    if not pieces:
+        return np.zeros(0, dtype=np.float32), m.sample_rate
+    audio = pieces[0]
+    for p in pieces[1:]:
+        audio = torch.cat([audio, gap, p])
+    return np.asarray(audio.numpy(), dtype=np.float32), m.sample_rate
 
 
 @app.post("/load")
