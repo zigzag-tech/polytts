@@ -121,6 +121,28 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="gpu",
 )
 
+def _inventory() -> dict:
+    """What this server HAS, for the fleet broker: the voice ids it can serve.
+
+    Published so a caller can ask Harmony for "a polytts in North America that
+    has voice X" in one request. Without it, placement knows only that both
+    North American nodes serve `polytts`, sends the synthesis to the nearer
+    one, and gets `404 Unknown voice_id` because the voice was cloned on the
+    other — a failure the placement layer had no way to avoid, having been
+    asked the wrong question.
+
+    Computed per call rather than snapshotted: cloning a voice adds one while
+    the process runs, and a stale inventory is how work is sent to a node that
+    no longer matches.
+    """
+    ids = list(voice_registry) or list(_mlx_voxcpm_voices) or list(voice_meta)
+    # Only what this server can answer for. The engines it can run are already
+    # in `units`, and advertising an engine list derived from the voices would
+    # be wrong on the MLX path, where the registry the loop reads is a
+    # different one.
+    return {"voice": ids} if ids else {}
+
+
 # --- polycore + livestack residency (same wiring as polyasr) ----------------
 # Build polycore ManagedUnits — the default engine is HARD_PIN (benchday needs TTS
 # hot at all times) — then attach() builds the manager+coordinator and mounts
@@ -212,6 +234,7 @@ if _MANAGER_PATH:
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
                                     gpu_call=_gpu_call, port=PORT,
+                                    inventory=_inventory,
                                     # After the bind, never before: see startup().
                                     preload=lambda: _warm_manager_path())
     except ImportError:
@@ -265,6 +288,7 @@ elif RUNTIME == "mlx":
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
                                     coload=True, gpu_call=_gpu_call, port=PORT,
+                                    inventory=_inventory,
                                     # After the bind, never before: see startup().
                                     preload=lambda: _warm_mlx())
     except ImportError:
