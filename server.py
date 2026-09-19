@@ -43,6 +43,9 @@ RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 # not flipping this flag. See docs/ — deferred.
 _MANAGER_PATH = RUNTIME != "mlx"
 IDLE_EVICT_SECONDS = int(os.environ.get("POLYTTS_IDLE_EVICT_SECONDS", "120"))
+# Whether two engines may hold the card at once. Off by default: the smallest
+# host this runs on cannot afford it. See the residency note below.
+COLOAD = os.environ.get("POLYTTS_COLOAD", "").strip().lower() in ("1", "true", "yes")
 DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
 
 # Engines whose non-x-vector cloning path consumes the reference TRANSCRIPT,
@@ -146,9 +149,20 @@ def _inventory() -> dict:
 # --- polycore + livestack residency (same wiring as polyasr) ----------------
 # Build polycore ManagedUnits — the default engine is HARD_PIN (benchday needs TTS
 # hot at all times) — then attach() builds the manager+coordinator and mounts
-# /livestack. Exclusive (coload=False): one engine in VRAM at a time, the other
-# evicted on switch. Without livestack, polycore's LocalCoordinator reproduces the
-# standalone one-model-in-VRAM + idle-evict behaviour. No hard dependency.
+# /livestack. Exclusive by default (coload=False): one engine in VRAM at a time,
+# the other evicted on switch. Without livestack, polycore's LocalCoordinator
+# reproduces the standalone one-model-in-VRAM + idle-evict behaviour. No hard
+# dependency.
+#
+# `POLYTTS_COLOAD=1` lets them share the card, because "one engine at a time" is
+# a claim about a MACHINE's VRAM and not about this code — the same reasoning
+# `POLYTTS_DEFAULT_RESIDENCY` already follows. It matters the moment one feed
+# speaks two languages: Chinese runs on VoxCPM and English on Qwen, so exclusive
+# residency evicts and reloads an engine on every language switch. Measured on
+# xc-tower-ubuntu 2026-09-19, the same English sentence took 30-45 s through the
+# resident Qwen engine and 70-82 s through a VoxCPM voice, the difference being
+# the swap back. On that host VoxCPM (~5.5 GB) and Qwen 1.7B (~4 GB) sit inside
+# 12.6 GB of free card.
 HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0"))
 if _MANAGER_PATH:
     from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda
@@ -246,7 +260,7 @@ if _MANAGER_PATH:
         # fallback would report 0 while the GPU thread is saturated; supplying it
         # here also gets the report labelled `in_flight_source: "server"`.
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
-                                    idle_seconds=IDLE_EVICT_SECONDS, coload=False,
+                                    idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                     gpu_call=_gpu_call, port=PORT,
                                     in_flight=lambda: _inflight,
                                     inventory=_inventory,
@@ -254,7 +268,7 @@ if _MANAGER_PATH:
                                     preload=lambda: _warm_manager_path())
     except ImportError:
         from livestack_node import ModelManager
-        manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
+        manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
 
 # MLX runtime: the native-MLX models (qwen `model`, voxcpm `_voxcpm_mlx`) are held
 # as globals and served by a separate native path (NOT engines.py, the PyTorch
