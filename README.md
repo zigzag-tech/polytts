@@ -309,6 +309,26 @@ not in them — so an MLX host with no venv will import-fail on every start. If
 you see `ModuleNotFoundError: No module named 'livestack_node'`, the venv is
 missing, not the dependency.
 
+### Who is asking — `X-Harmony-Owner`
+
+A hub that authenticated a caller relays who they are on every engine request:
+
+    X-Harmony-Owner: benchday:acct_b
+
+The header name and its semantics are owned by `livestack/HARMONY.md` → "Who
+is asking": the header is an **assertion, not a credential** — the fleet
+broker resolves the owner against the engine's own delegating token, so a
+caller cannot name an owner the engine's principal was not granted. Absent
+header means the engine charges the request to its own identity, and the
+ledger marks the admission `owner_asserted: false`.
+
+polytts is a passive Harmony node today: its identity-bearing surface is the
+`/livestack` lease (`owner_id`), which a hub-fronted caller sets to the
+asserted owner, and this process holds no inbound-header → admission path of
+its own. When a hub fronts this engine through an admitting surface, the
+engine forwards `X-Harmony-Owner` as the owner at that call, exactly as
+harmony-llm does (see `livestack/node-py/examples/harmony-llm/server.py`).
+
 ## Voices
 
 Uploaded voices live in `polytts/voices/`. Each voice directory contains:
