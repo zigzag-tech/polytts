@@ -17,6 +17,7 @@ import json
 import hashlib
 import asyncio
 import concurrent.futures
+import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -120,6 +121,28 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="gpu",
 )
 
+def _inventory() -> dict:
+    """What this server HAS, for the fleet broker: the voice ids it can serve.
+
+    Published so a caller can ask Harmony for "a polytts in North America that
+    has voice X" in one request. Without it, placement knows only that both
+    North American nodes serve `polytts`, sends the synthesis to the nearer
+    one, and gets `404 Unknown voice_id` because the voice was cloned on the
+    other — a failure the placement layer had no way to avoid, having been
+    asked the wrong question.
+
+    Computed per call rather than snapshotted: cloning a voice adds one while
+    the process runs, and a stale inventory is how work is sent to a node that
+    no longer matches.
+    """
+    ids = list(voice_registry) or list(_mlx_voxcpm_voices) or list(voice_meta)
+    # Only what this server can answer for. The engines it can run are already
+    # in `units`, and advertising an engine list derived from the voices would
+    # be wrong on the MLX path, where the registry the loop reads is a
+    # different one.
+    return {"voice": ids} if ids else {}
+
+
 # --- polycore + livestack residency (same wiring as polyasr) ----------------
 # Build polycore ManagedUnits — the default engine is HARD_PIN (benchday needs TTS
 # hot at all times) — then attach() builds the manager+coordinator and mounts
@@ -129,6 +152,41 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
 HOST_ID = os.environ.get("POLYTTS_HOST_ID", os.environ.get("HOST_ID", "zz-tower0"))
 if _MANAGER_PATH:
     from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda
+
+    # A PyTorch runtime with no accelerator is not a slow TTS server; it is a
+    # broken one that nothing downstream can detect.
+    #
+    # Measured: xc-tower-ubuntu ran this service for a week reporting
+    # `"device": "cpu"` on a box with two RTX 3090s. torch decides
+    # `cuda.is_available()` once, at import, so a process that starts while the
+    # driver is reloading keeps that answer until it is restarted — and every
+    # engine it loads afterwards goes to system memory. Nothing failed. The
+    # residency manager warmed models, leases were granted, syntheses returned,
+    # and each one took an order of magnitude longer than it should have. The
+    # only symptom was a field in /health that nobody reads.
+    #
+    # Harmony loads and unloads MODELS; it cannot repair a PROCESS that has
+    # decided there is no GPU. Refusing to start is what makes that visible, at
+    # the one moment somebody is watching — a failed unit — instead of at the
+    # worst one, which is never.
+    #
+    # `POLYTTS_ALLOW_CPU=1` is the escape hatch, for a box that genuinely has
+    # no accelerator and wants a slow server on purpose.
+    import torch as _torch_probe
+
+    _has_cuda = _torch_probe.cuda.is_available()
+    _mps = getattr(_torch_probe.backends, "mps", None)
+    _has_mps = bool(_mps and _mps.is_available())
+    if not _has_cuda and not _has_mps and os.environ.get("POLYTTS_ALLOW_CPU") != "1":
+        raise SystemExit(
+            f"polytts: POLYTTS_RUNTIME={RUNTIME} needs CUDA or MPS and torch sees neither "
+            f"(torch {_torch_probe.__version__}, cuda build {_torch_probe.version.cuda}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}). "
+            "A CPU synthesis is ~10x slower and reports success, so this refuses to start "
+            "rather than serve it. If the GPU is there, the driver was probably not ready "
+            "when this process began: restart the unit. If this box has no accelerator, set "
+            "POLYTTS_ALLOW_CPU=1."
+        )
 
     # VRAM footprints (bytes; estimates from nvidia-smi, refine with measure_footprint).
     # `dots` is MEASURED, not estimated, and the number is driven by the CLONE
@@ -190,7 +248,10 @@ if _MANAGER_PATH:
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=False,
                                     gpu_call=_gpu_call, port=PORT,
-                                    in_flight=lambda: _inflight)
+                                    in_flight=lambda: _inflight,
+                                    inventory=_inventory,
+                                    # After the bind, never before: see startup().
+                                    preload=lambda: _warm_manager_path())
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=False)
@@ -242,7 +303,10 @@ elif RUNTIME == "mlx":
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
                                     coload=True, gpu_call=_gpu_call, port=PORT,
-                                    in_flight=lambda: _inflight)
+                                    in_flight=lambda: _inflight,
+                                    inventory=_inventory,
+                                    # After the bind, never before: see startup().
+                                    preload=lambda: _warm_mlx())
     except ImportError:
         manager = None
         residence = None
@@ -825,31 +889,64 @@ def _resolve_engine(req_engine, voice_id):
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
+def _warm_mlx() -> None:
+    """Load what MLX serving needs. Runs AFTER the port is bound — see below."""
+    global manager
+    if manager is not None:
+        manager.ensure("qwen")
+    else:
+        _load_mlx()
+    _load_voices_mlx()
+    # Pre-load the voxcpm model when voxcpm voices exist so the first request
+    # isn't slow. Never fail the warm if it can't load.
+    if _mlx_voxcpm_voices:
+        try:
+            _load_voxcpm_mlx()
+        except Exception as e:
+            print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
+
+
+def _warm_manager_path() -> None:
+    """Load the pinned default engine on the GPU executor."""
+    _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
+
+
 @app.on_event("startup")
 async def startup():
     global manager
+
+    # **Nothing that loads a model happens here any more, and the reason is a
+    # deadlock rather than a preference.**
+    #
+    # A FastAPI startup hook runs BEFORE uvicorn binds. A load in here means the
+    # port stays closed until it finishes, so the broker cannot snapshot this
+    # node, so it never learns this process hosts `polytts` — and `admit` for an
+    # unknown kind is a refusal, by design, because a refusal and an outage must
+    # not look alike. `manager.ensure` then waits for a grant that cannot come.
+    #
+    # Measured on xc-mac-studio, 2026-09-18: the local broker answered
+    # `defer polytts-708943429 (unknown kind)` and this process sat with no
+    # listener, no open sockets and no CPU. The fleet showed `mia`,
+    # `Connection refused`, for forty-six hours — and a restart landed straight
+    # back in it.
+    #
+    # `attach(preload=...)` warms after the facade answers, which is the only
+    # place the cycle can be broken: bound, then announced, then snapshotted,
+    # then warmed. While it warms the node reports `ready: false`, which the
+    # fleet view models and the ranker filters on, so an unwarmed node is not
+    # chosen rather than chosen and slow.
     if RUNTIME == "mlx":
-        # Load the HARD_PIN qwen unit through the manager (registers residency
-        # with the broker); direct load if no manager is wired.
-        if manager is not None:
-            manager.ensure("qwen")
-        else:
-            _load_mlx()
-        _load_voices_mlx()
-        # Pre-load the voxcpm model when voxcpm voices exist so the first
-        # request isn't slow. Never fail startup if it can't load.
-        if _mlx_voxcpm_voices:
-            try:
-                _load_voxcpm_mlx()
-            except Exception as e:
-                print(f"[voxcpm-mlx] preload failed (voxcpm voices will 503): {e}")
+        if manager is None:
+            # No livestack: nobody will warm this for us, and there is no
+            # arbitration to deadlock against either. Own thread, so the bind
+            # still happens now.
+            threading.Thread(target=_warm_mlx, name="polytts-warm", daemon=True).start()
         return
 
-    # Manager path: manager + residency were wired by attach() at import. Preload
-    # the pinned default engine (benchday needs it hot) and start the idle sweep,
-    # which calls manager.maybe_evict() -> coordinator.idle_sweep().
     _scan_voice_registry()
-    _gpu_executor.submit(manager.ensure, DEFAULT_ENGINE).result()
+    if manager is not None and residence is None:
+        # Same case on the manager path: no livestack attach, no preload hook.
+        threading.Thread(target=_warm_manager_path, name="polytts-warm", daemon=True).start()
 
     async def _idle_loop():
         loop = asyncio.get_running_loop()
@@ -1369,5 +1466,44 @@ def health():
     return info
 
 
+def _refuse_if_port_taken() -> None:
+    """A port already in use is a failure, and uvicorn reports it as success.
+
+    Measured on xc-mac-studio: two instances raced, the loser logged
+    `[Errno 48] address already in use`, shut down gracefully and **exited 0**.
+    `run.sh` reads exit 0 as "server exited cleanly", breaks its restart loop,
+    and leaves the launchd job holding a wrapper with no server inside it.
+    launchd saw a healthy job; the fleet saw the node `mia` with
+    `Connection refused` — for forty-six hours.
+
+    Checked before uvicorn starts, so the exit code says what happened. There
+    is a race between this probe and the bind; it does not matter, because the
+    bind failure after it is the same non-zero exit, which is all `run.sh`
+    needed in the first place.
+    """
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Deliberately NOT SO_REUSEADDR: the question is "is somebody serving
+    # here", and the option exists to make that question answer no.
+    try:
+        probe.bind(("0.0.0.0", PORT))
+    except OSError as exc:
+        import errno as _errno
+
+        what = ("another process is already serving it"
+                if exc.errno == _errno.EADDRINUSE
+                else "this process cannot bind it")
+        raise SystemExit(
+            f"polytts: port {PORT} is unavailable — {what} ({exc}). "
+            f"Check `lsof -nP -iTCP:{PORT} -sTCP:LISTEN`. Refusing to start: a second "
+            "instance exits 0 after its failed bind, and every supervisor above reads "
+            "that as a clean shutdown."
+        )
+    finally:
+        probe.close()
+
+
 if __name__ == "__main__":
+    _refuse_if_port_taken()
     uvicorn.run(app, host="0.0.0.0", port=PORT)
