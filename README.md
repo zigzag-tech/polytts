@@ -179,6 +179,8 @@ POLYTTS_RUNTIME=pytorch POLYTTS_IDLE_EVICT_SECONDS=120 ./run.sh
 | `POLYTTS_TIMEOUT` | `600` | Per-request generation timeout in seconds |
 | `POLYTTS_IDLE_EVICT_SECONDS` | `120` | Manager path: evict the resident model after this many idle seconds |
 | `POLYTTS_DEFAULT_ENGINE` | `qwen` | Manager path: engine for voices/requests that don't specify one |
+| `POLYTTS_DEFAULT_RESIDENCY` | `SOFT_PIN` | Manager path: residency for the default engine. "Keep TTS hot" is a claim about a MACHINE — on a box whose GPUs also serve LLMs, a pinned 5 GB engine can be why a model that IS being asked for has nowhere to go |
+| `POLYTTS_COLOAD` | off | Let two engines hold the card at once. Off suits the smallest host; set it where the card can take it. **It matters the moment one feed speaks two languages**: Chinese runs on VoxCPM and English on Qwen, so exclusive residency swaps an engine on every language change. Measured on xc-tower-ubuntu 2026-09-19, the same English sentence took 30–45 s through the resident Qwen engine and 70–82 s through a VoxCPM voice, the difference being the swap back. VoxCPM ~5.5 GB + Qwen 1.7B ~4 GB fits 12.6 GB of free card |
 | `VOXCPM_MODEL_ID` | `openbmb/VoxCPM2` | HuggingFace model ID for the VoxCPM engine |
 | `VOXCPM_CFG_VALUE` | `3.3` | VoxCPM guidance scale |
 | `VOXCPM_TIMESTEPS` | `10` | VoxCPM diffusion inference steps |
@@ -218,6 +220,14 @@ curl -X POST http://localhost:8100/voices \
 ```
 
 ### `POST /tts`
+
+> **`language` takes an ISO code or a name.** `en` and `English` both work,
+> on this endpoint and on the streaming one. They did not always: `/tts` read
+> the field raw while the streaming path mapped it through `_lang_name`, so
+> `en` — what the phone sends, and what anything speaking BCP-47 sends —
+> reached the engine unmapped and came back a 500, `Unsupported languages:
+> ['en']. Supported: ['auto', 'chinese', 'english', …]`. Fixed 2026-09-19;
+> if you add a third path, map it there too.
 
 Generate speech from text using a registered `voice_id`.
 
