@@ -320,7 +320,12 @@ elif RUNTIME == "mlx":
                                     in_flight=lambda: _inflight,
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
-                                    preload=lambda: _warm_mlx())
+                                    # On the GPU executor, like every other MLX call: MLX
+                                    # streams are per-thread, so weights loaded on the
+                                    # attach thread abort the first synthesis on the
+                                    # executor ("There is no Stream(cpu, 1) in current
+                                    # thread" -> SIGABRT, launchd restart loop).
+                                    preload=lambda: _gpu_call(_warm_mlx))
     except ImportError:
         manager = None
         residence = None
@@ -954,7 +959,10 @@ async def startup():
             # No livestack: nobody will warm this for us, and there is no
             # arbitration to deadlock against either. Own thread, so the bind
             # still happens now.
-            threading.Thread(target=_warm_mlx, name="polytts-warm", daemon=True).start()
+            # The thread only waits; the load itself runs on the GPU executor
+            # (MLX streams are per-thread — see the attach preload above).
+            threading.Thread(target=lambda: _gpu_executor.submit(_warm_mlx).result(),
+                             name="polytts-warm", daemon=True).start()
         return
 
     _scan_voice_registry()
