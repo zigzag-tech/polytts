@@ -24,11 +24,13 @@ import io
 import hashlib
 import time
 import threading
+import importlib.metadata
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import requests
+from synthesis_jobs import CancellationSignal
 
 
 def pcm16(audio_f32) -> bytes:
@@ -88,6 +90,9 @@ class Engine:
         """Yield audio_float32_1d chunks. Default: one chunk via generate()."""
         audio, _sr = self.generate(text, voice_id, voice_dir, meta, language, gen_kwargs)
         yield audio
+
+    def cancellation_capability(self):
+        return {"supported": False, "scope": [], "mechanism": None, "bounded_latency": False}
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +166,38 @@ class QwenEngine(Engine):
             voice_clone_prompt=self._prompts[voice_id], **gk)
         return np.asarray(wavs[0], dtype=np.float32), sr
 
+    def cancellation_capability(self):
+        # These are the source-reviewed APIs. An unreviewed package revision
+        # must not silently acquire a physical-cancellation capability.
+        try:
+            supported = (importlib.metadata.version('qwen-tts') == '0.1.1' and
+                         importlib.metadata.version('transformers') == '4.57.3')
+        except importlib.metadata.PackageNotFoundError:
+            supported = False
+        return {"supported": supported, "scope": ["synthesis"] if supported else [],
+                "mechanism": "transformers_stopping_criteria_and_accelerator_sync" if supported else None,
+                "bounded_latency": False}
+
+    def generate_cancellable(self, text, voice_id, voice_dir, meta, language, gen_kwargs, cancellation: CancellationSignal):
+        from transformers import StoppingCriteria, StoppingCriteriaList
+        import torch
+
+        class OwnedStop(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                return torch.full((input_ids.shape[0],), cancellation.event.is_set(),
+                                  device=input_ids.device, dtype=torch.bool)
+
+        cancellation.check()
+        self.prepare_voice(voice_id, voice_dir, meta)
+        # Prompt extraction is not advertised as independently cancellable.
+        # An existing prompt or its completed preprocessing is required before
+        # the cancellable token generation starts.
+        cancellation.check()
+        audio, sr = self.generate(text, voice_id, voice_dir, meta, language,
+                                  {**gen_kwargs, "stopping_criteria": StoppingCriteriaList([OwnedStop()])})
+        cancellation.check()  # cancelled partial output never becomes audio/cache
+        return audio, sr
+
 
 # ---------------------------------------------------------------------------
 # VoxCPM2 engine
@@ -225,6 +262,42 @@ class VoxcpmEngine(Engine):
         ck = self._clone_kwargs(voice_dir, meta, gen_kwargs)
         for chunk in self._model.generate_streaming(text=text, **ck):
             yield np.asarray(chunk, dtype=np.float32)
+
+    def cancellation_capability(self):
+        try:
+            supported = importlib.metadata.version('voxcpm') == '2.0.3'
+        except importlib.metadata.PackageNotFoundError:
+            supported = False
+        return {"supported": supported, "scope": ["synthesis"] if supported else [],
+                "mechanism": "stream_generator_close_and_accelerator_sync" if supported else None,
+                "bounded_latency": False}
+
+    def generate_cancellable(self, text, voice_id, voice_dir, meta, language, gen_kwargs, cancellation: CancellationSignal):
+        cancellation.check()
+        if voice_id is None:
+            # Explicit native synthesis: no reference, prompt or registered
+            # voice is read. Preserve supplied narration; no text normalizer.
+            kwargs = {"cfg_value": gen_kwargs.get("cfg_value", self._cfg),
+                      "inference_timesteps": gen_kwargs.get("inference_timesteps", self._steps),
+                      "normalize": False}
+        else:
+            kwargs = self._clone_kwargs(voice_dir, meta, gen_kwargs)
+            kwargs["normalize"] = False
+        chunks = []
+        stream = self._model.generate_streaming(text=text, **kwargs)
+        try:
+            while True:
+                cancellation.check()
+                try:
+                    chunk = next(stream)
+                except StopIteration:
+                    break
+                cancellation.check()
+                chunks.append(np.asarray(chunk, dtype=np.float32))
+        finally:
+            stream.close()
+        cancellation.check()
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32), self.sample_rate
 
 
 # ---------------------------------------------------------------------------

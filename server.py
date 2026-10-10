@@ -32,6 +32,8 @@ from pydantic import BaseModel
 import cache
 import pcm_cache
 from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16
+from synthesis_api import create_synthesis_router
+from synthesis_jobs import SynthesisJobs
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -1161,6 +1163,86 @@ def _gen_chunks(engine_name, req):
     if ms is None:
         ms = MAX_SENTENCES_PER_GEN.get(engine_name, 0)
     return _chunk_text(req.text, mc, ms)
+
+
+def _synchronize_owned_synthesis():
+    """Called only on the shared serial GPU executor, after this job stops."""
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
+_synthesis_jobs = SynthesisJobs(_gpu_executor, _synchronize_owned_synthesis)
+
+
+def _synthesis_capabilities():
+    engines = {}
+    if _MANAGER_PATH and manager is not None:
+        for name, engine in _ENGINES.items():
+            cancellation = engine.cancellation_capability()
+            engines[name] = {"physical_cancellation": cancellation,
+                "voice_modes": (["registered", "native"] if name == "voxcpm" else ["registered"]),
+                "voice_preprocessing_cancellation": False}
+    return {"runtime": RUNTIME, "engines": engines,
+        # Manager /voices only stores source material; clone prompt extraction
+        # is lazy INSIDE the owned synthesis job. MLX registration precomputes.
+        "voice_registration_gpu": not _MANAGER_PATH,
+        "legacy_http_abort_stops_gpu": False,
+        "receipt_persistence": "process_memory", "bounded_physical_cancellation": False}
+
+
+def _prepare_owned_synthesis(request, voice_mode):
+    req = TTSRequest(**request)
+    if not _MANAGER_PATH or manager is None:
+        raise HTTPException(409, "owned physical cancellation requires the manager runtime")
+    if not req.text.strip():
+        raise HTTPException(400, "text must not be empty")
+    if voice_mode == "native":
+        if req.engine != "voxcpm" or req.voice_id is not None:
+            raise HTTPException(400, "native synthesis requires engine=voxcpm and no voice_id")
+        engine_name, entry = "voxcpm", None
+    else:
+        if not req.voice_id:
+            raise HTTPException(400, "registered synthesis requires voice_id")
+        engine_name, entry = _resolve_engine(req.engine, req.voice_id)
+        if entry is None or engine_name != entry["engine"]:
+            raise HTTPException(404, "unknown or mismatched registered voice")
+    engine = _ENGINES.get(engine_name)
+    if engine is None or not engine.cancellation_capability()["supported"]:
+        raise HTTPException(409, "engine does not support qualified cooperative physical cancellation")
+    language = _lang_name(req.language or "Chinese")
+    kwargs = _generation_kwargs(req)
+    kwargs["non_streaming_mode"] = req.non_streaming_mode if req.non_streaming_mode is not None else False
+
+    def owned_worker(cancellation):
+        global _inflight
+        cancellation.check()
+        _inflight += 1
+        try:
+            eng = manager.ensure(engine_name)
+            cancellation.check()
+            parts, sr = [], None
+            for text in _gen_chunks(engine_name, req):
+                cancellation.check()
+                audio, rate = eng.generate_cancellable(text, req.voice_id,
+                    entry["dir"] if entry else None, entry["meta"] if entry else None,
+                    language, kwargs, cancellation)
+                parts.append(np.asarray(audio, dtype=np.float32))
+                sr = sr or rate
+            cancellation.check()
+            audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+            buf = io.BytesIO()
+            sf.write(buf, audio, sr or eng.sample_rate, subtype="PCM_16", format="WAV")
+            return buf.getvalue()
+        finally:
+            _inflight -= 1
+
+    return engine_name, owned_worker
+
+
+app.include_router(create_synthesis_router(_synthesis_jobs, _synthesis_capabilities, _prepare_owned_synthesis))
 
 
 @app.post("/tts")

@@ -493,3 +493,87 @@ The MLX backend auto-downloads from HuggingFace on first run. If you're behind a
 The voice needs both `voice.wav` and a non-empty `ref_text` field in
 `voices/<voice_id>/meta.json`. Prefer registering voices through `POST /voices`
 so the server creates the correct metadata and model-specific prompt cache.
+
+## Owned synthesis jobs and physical cancellation
+
+The optional job API preserves `/tts`, `/tts/stream`, and `/voices` defaults.
+HTTP abort on those legacy synthesis endpoints does **not** stop GPU work.
+New clients must inspect `GET /tts/capabilities` before submitting a strict job.
+The response has `job_protocol_version: 1`, a `server_instance_id`, per-engine
+`physical_cancellation` and `voice_modes`, and `voice_registration_gpu`.
+
+Only source-reviewed manager backends advertise cancellation: Qwen uses
+`qwen-tts==0.1.1` with `transformers==4.57.3`, forwarding an owned
+`StoppingCriteriaList`; VoxCPM uses `voxcpm==2.0.3`, closing the native streaming
+generator at an audio yield boundary. Other revisions and MLX are unsupported.
+The capability describes cooperative synthesis cancellation, not an upper bound
+on stopping a GPU kernel. `bounded_physical_cancellation` is false. Model loading
+and reference-prompt extraction may finish before the next cancellation check.
+No process, service, other job, or GPU is killed to cancel a request.
+
+`POST /tts/jobs` accepts:
+
+```json
+{
+  "job_id": "a-client-generated-UUID",
+  "owner_id": "documentary:run-id",
+  "control_token": "a-client-generated-random-256-bit-secret",
+  "voice_mode": "native",
+  "request": {
+    "text": "The exact supplied narration.",
+    "engine": "voxcpm",
+    "language": "English"
+  }
+}
+```
+
+The client generates and retains the ID and secret **before** submission. Retry
+with the same ID, owner, secret and request is idempotent; changed text/profile
+is refused. Tokens are not included in receipts. Native mode requires an
+explicit `engine: voxcpm` and no `voice_id`; it reads no registered voice,
+reference recording, or prompt audio. It uses base-model speech, and its quality
+and suitability still need audio verification. Registered mode requires the
+declared engine's existing voice and does not choose a replacement voice.
+The new VoxCPM job path disables text normalization and performs no semantic
+narration repair. The original endpoints keep their existing behavior.
+
+Use `Authorization: Bearer <control_token>` for:
+
+- `GET /tts/jobs/{job_id}` — inspect the owned receipt.
+- `POST /tts/jobs/{job_id}/cancel`, body `{"owner_id":"documentary:run-id"}` —
+  request cooperative cancellation. This also creates an owned tombstone before
+  submission, so delayed acceptance cannot start work after a lost response.
+- `GET /tts/jobs/{job_id}/audio` — read completed, physically settled WAV bytes.
+
+A running cancel returns `state: cancel_requested`, `executor_active: true`,
+`physical_settled: false`. It becomes `cancelled` only after the executor future
+finishes and the CUDA/MPS synchronization barrier succeeds. Queued cancellation
+settles without starting that job. A failed barrier remains unconfirmed and
+never exposes an audio result. Receipts carry request/result SHA256 fingerprints,
+owner, engine, instance identity and Unix-second timestamps. The request hash is
+over sorted compact Python JSON `{request, voice_mode}`; it is an opaque server
+fingerprint, not a shared cross-language canonical digest.
+
+Clients must poll cancellation settlement with a separate bounded cleanup
+request budget, keep residency until physical settlement, and report an explicit
+unconfirmed cancellation if the service cannot prove it. A 20-second model
+deadline does not mean a 20-second physical stop. Manager `/voices` registration
+only stores reference material (`voice_registration_gpu: false`); prompt
+preprocessing happens inside the owned job and is not independently cancellable.
+MLX registration can perform GPU work and is not qualified for this contract.
+
+Job records and audio currently live in process memory, with a bounded 256-job
+receipt capacity. They are not evicted automatically. A restart changes the
+instance ID; it does not prove a previous job settled. Durable private client
+control storage, restart reconciliation, source-bound packaging, service
+activation, and a real GPU cancellation/voice-quality qualification remain
+release prerequisites. These source changes do not certify a deployed service.
+
+Source verification on 2026-10-10: all 11 new job/API/engine tests passed without
+models or GPU synthesis. The full suite ran 15 tests: 12 passed, 3 existing
+server-import tests skipped because `livestack_node` is absent. Python compilation
+passed. The reviewed provider wheels were `qwen_tts-0.1.1` SHA256
+`11a290d8dabc7ef91a90c54478c8ab19b3edb1d85c0882313721892bdc4af15d`
+and `voxcpm-2.0.3` SHA256
+`24da58a30d094a9e9a7ead450ae9cffda0d31eaeba620b61ad99179dd87e486b`.
+They were inspected as source artifacts, not installed or run as model backends.
