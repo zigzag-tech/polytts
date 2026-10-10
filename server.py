@@ -34,6 +34,7 @@ import pcm_cache
 from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16
 from synthesis_api import create_synthesis_router
 from synthesis_jobs import SynthesisJobs
+from model_paths import resolve_models_dir
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -63,7 +64,7 @@ VOICES_DIR = Path(os.environ.get(
     "POLYTTS_VOICES_DIR",
     str(Path(__file__).resolve().parent / "voices"),
 ))
-MODELS_DIR = Path(__file__).resolve().parent / "models"
+MODELS_DIR = resolve_models_dir(Path(__file__).resolve().parent / "models")
 PORT = int(os.environ.get("POLYTTS_PORT", "8100"))
 TTS_TIMEOUT = int(os.environ.get("POLYTTS_TIMEOUT_SECONDS", "600"))
 # Audio seconds per streamed chunk.  Lower = faster first-audio, more overhead.

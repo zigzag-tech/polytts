@@ -288,6 +288,14 @@ curl http://localhost:8100/health | python3 -m json.tool
 | `run.sh` | Starts the server using `venv/bin/python`, `python`, or `python3` |
 | `setup.sh` | First-time setup: creates or repairs `venv`, installs deps, downloads models |
 
+Immutable source installations may set `POLYTTS_MODELS_DIR` to an explicit
+absolute directory containing the existing Qwen model assets. Unset preserves
+the current source-relative `models/` path. Empty or relative explicit bindings
+refuse before model work. Model files remain separately owned deployment inputs;
+this setting downloads no weights, changes no voice selection and grants no
+Harmony admission. Existing private voice storage has its separate
+`POLYTTS_VOICES_DIR` binding and is not copied into source packages.
+
 ### The MLX path needs `livestack-node`, and nothing installs it for you
 
 On Apple Silicon (`POLYTTS_RUNTIME=mlx`) `server.py` hard-imports
