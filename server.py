@@ -1246,6 +1246,42 @@ def _prepare_owned_synthesis(request, voice_mode):
 app.include_router(create_synthesis_router(_synthesis_jobs, _synthesis_capabilities, _prepare_owned_synthesis))
 
 
+def configure_provider_fence(authorize_operator, source_identity):
+    """Trusted installed owner entry calls once, before serving or startup.
+
+    Legacy defaults remain unchanged until this explicit bootstrap is selected.
+    The source identity and authorizer must come from the installed owner policy,
+    never an incoming synthesis request or documentary execution profile.
+    """
+    global _gpu_executor
+    import re
+    from livestack_node.provider_fence import ProviderFence, install_provider_fence
+    if getattr(app.state, 'provider_fence', None) is not None:
+        raise RuntimeError('provider_fence_already_configured')
+    fence = ProviderFence(authorize_operator)
+    def synchronize():
+        if RUNTIME == 'mlx':
+            import mlx.core as mx
+            mx.synchronize()
+        else:
+            _synchronize_owned_synthesis()
+    def bypass(scope):
+        path, method = scope['path'], scope.get('method')
+        if method == 'GET' and path in ('/health', '/tts/capabilities'):
+            return True
+        # Existing endpoint token validation remains mandatory.
+        return bool(re.fullmatch(r'/tts/jobs/[A-Za-z0-9-]+(?:/audio)?', path) and method == 'GET'
+            or re.fullmatch(r'/tts/jobs/[A-Za-z0-9-]+/cancel', path) and method == 'POST')
+    install_provider_fence(app, fence, bypass, source_identity)
+    _gpu_executor = fence.executor(_gpu_executor, synchronize)
+    # This owner module constructs the registry before routes; retain that exact
+    # registry and control-token history while replacing its executor adapter.
+    _synthesis_jobs._executor = _gpu_executor
+    app.state.provider_fence = fence
+    return fence
+
+
+
 @app.post("/tts")
 async def tts(req: TTSRequest):
     # `_lang_name`, exactly as the streaming path below does it. This one took
