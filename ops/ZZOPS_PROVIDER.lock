@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "d0fc5d1084bab63cb71745479e6f5865db1b1985",
+  "revision": "5c1ea4bcb247b42224e1fc897d1999f292726ec2",
   "export": "zzops/provider-owner",
-  "qualification": "source-only kernel seal and exact submitted-start/physical reverse; no installed provider activation"
+  "qualification": "source-only registered bounded qualification window and held reverse; no installed provider or inference qualification"
 }

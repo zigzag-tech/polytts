@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "ea0977f52ca82a5710d8daf5b73be45b22622e16",
+  "revision": "af28839c93b5940643af3deaa92fd56246fc01ab",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only; no installed environment/provider qualification"
+  "qualification": "source-only registered bounded qualification window and held reverse; no installed provider or inference qualification"
 }
