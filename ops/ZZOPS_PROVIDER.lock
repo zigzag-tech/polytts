@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "95416be0c8d9c4a219f80ac6decdea097259f257",
+  "revision": "f35919fc4e5402aa64a24359aa483fbf845193a1",
   "export": "zzops/provider-owner",
   "qualification": "source-only; no installed activation"
 }
