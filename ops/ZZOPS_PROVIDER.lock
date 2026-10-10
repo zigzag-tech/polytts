@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "cc60344a984edd5fe8a036cf64b0ebf0f16a8411",
+  "revision": "c0cf479e8fe736a5d7de94833fab3030babbacc5",
   "export": "zzops/provider-owner",
-  "qualification": "source-only closed provider unit controls and registered adoption; no provider activation"
+  "qualification": "source-only kernel seal and registered first-adoption reverse; no installed provider activation"
 }
