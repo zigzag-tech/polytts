@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "c9644208e4932f655e3ce840af7ad34f94bad7c3",
+  "revision": "ea0977f52ca82a5710d8daf5b73be45b22622e16",
   "entry": "livestack_node.provider_entry",
   "qualification": "source-only; no installed environment/provider qualification"
 }
