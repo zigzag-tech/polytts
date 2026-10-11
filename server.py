@@ -269,6 +269,9 @@ if _MANAGER_PATH:
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                     gpu_call=_gpu_call, port=PORT,
+                                    device_id=os.environ.get('POLYTTS_QUALIFICATION_DEVICE_ID') if QUALIFICATION_ONLY else None,
+                                    device_meter=None if QUALIFICATION_ONLY else 'auto',
+                                    activation_store=os.environ.get('POLYTTS_QUALIFICATION_ACTIVATION_STORE') if QUALIFICATION_ONLY else None,
                                     in_flight=lambda: _inflight,
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
