@@ -96,6 +96,9 @@ MAX_SENTENCES_PER_GEN = {
 }
 
 app = FastAPI(title="PolyTTS Server")
+if QUALIFICATION_ONLY:
+    from livestack_node.qualification_ingress import QualificationIngress
+    app.add_middleware(QualificationIngress, provider='polytts')
 
 # Filled at startup
 model = None
@@ -1247,7 +1250,36 @@ def _prepare_owned_synthesis(request, voice_mode):
     return engine_name, owned_worker
 
 
-app.include_router(create_synthesis_router(_synthesis_jobs, _synthesis_capabilities, _prepare_owned_synthesis))
+def configure_provider_qualification(gate):
+    """Only the source-bound installed owner bootstrap supplies this gate."""
+    from livestack_node.qualification_node import QualificationNodeGate
+    if not QUALIFICATION_ONLY or not _MANAGER_PATH or manager is None or not isinstance(gate, QualificationNodeGate) or gate.manager is not manager or getattr(app.state, 'qualification_gate', None) is not None:
+        raise RuntimeError('qualification_owned_manager_gate_required')
+    app.state.qualification_gate = gate
+
+
+def _authorize_owned_qualification(submission, fingerprint, authorization):
+    if not QUALIFICATION_ONLY:
+        return None
+    gate = getattr(app.state, 'qualification_gate', None)
+    if gate is None:
+        raise HTTPException(503, 'qualification owner bootstrap absent')
+    language = submission.request.get('language')
+    if submission.request.get('engine') != 'voxcpm' or not isinstance(language,str) or not language.strip() or _lang_name(language) != 'English':
+        raise PermissionError('explicit English VoxCPM qualification input required')
+    job = {'jobId':submission.job_id,'ownerId':submission.owner_id,'inputDigest':fingerprint,'modelKind':'voxcpm'}
+    receipt = gate.admit(job,authorization)
+    def wrap(worker):
+        def physical_worker(cancellation):
+            cancellation.check()
+            with gate.work(job,authorization,receipt['fence']):
+                return worker(cancellation)
+        return physical_worker
+    return wrap
+
+
+app.include_router(create_synthesis_router(_synthesis_jobs, _synthesis_capabilities, _prepare_owned_synthesis,
+    authorize=_authorize_owned_qualification))
 
 
 def configure_provider_fence(authorize_operator, source_identity):

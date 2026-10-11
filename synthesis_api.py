@@ -1,6 +1,4 @@
 """Optional owned-job API; the historical /tts endpoints are unchanged."""
-import hashlib
-import json
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException
@@ -8,6 +6,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from synthesis_jobs import JobCapacity, JobConflict
+from synthesis_input import synthesis_input_digest
 
 
 class SynthesisSubmission(BaseModel):
@@ -22,7 +21,7 @@ class SynthesisCancellation(BaseModel):
     owner_id: str
 
 
-def create_synthesis_router(jobs, capabilities, prepare):
+def create_synthesis_router(jobs, capabilities, prepare, *, authorize=None):
     """prepare validates without GPU work, returning (engine, worker)."""
     router = APIRouter()
 
@@ -48,12 +47,21 @@ def create_synthesis_router(jobs, capabilities, prepare):
         return {"job_protocol_version": 1, "server_instance_id": jobs.instance_id, **capabilities()}
 
     @router.post("/tts/jobs")
-    def submit_owned_job(submission: SynthesisSubmission):
+    def submit_owned_job(submission: SynthesisSubmission, x_provider_qualification_authorization: str | None = Header(default=None)):
         # The hash excludes the control secret and includes the exact caller
         # request/profile. No semantic rewriting or repair happens here.
-        fingerprint = hashlib.sha256(json.dumps({"request": submission.request,
-            "voice_mode": submission.voice_mode}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        fingerprint = synthesis_input_digest(submission.request,submission.voice_mode)
+        wrapper = None
+        if authorize is not None:
+            try:
+                wrapper = authorize(submission, fingerprint, x_provider_qualification_authorization)
+            except PermissionError:
+                raise HTTPException(403, "qualification canonical input refused")
+            except ValueError:
+                raise HTTPException(400, "qualification input binding refused")
         engine, worker = call(lambda: prepare(submission.request, submission.voice_mode))
+        if wrapper is not None:
+            worker = wrapper(worker)
         return call(lambda: jobs.submit(submission.job_id, submission.owner_id,
             submission.control_token, fingerprint, engine, worker))
 

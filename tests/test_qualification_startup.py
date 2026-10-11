@@ -24,7 +24,14 @@ class QualificationStartupTests(unittest.TestCase):
         self.assertEqual(len(guard.body), 1)
         self.assertIsInstance(guard.body[0], ast.Return)
         retained = [node for node in startup.body if node is not guard]
-        digest = hashlib.sha256(ast.dump(ast.Module(body=retained, type_ignores=[]), include_attributes=False).encode()).hexdigest()
+        module = ast.Module(body=retained, type_ignores=[])
+        # Python3.12 adds an empty type_params field to ordinary definitions.
+        # Preserve the exact3.11 baseline serialization; nonempty type params
+        # remain in the dump and cannot pass the unchanged original hash.
+        for node in ast.walk(module):
+            if hasattr(node,'type_params') and node.type_params == []:
+                delattr(node,'type_params')
+        digest = hashlib.sha256(ast.dump(module, include_attributes=False).encode()).hexdigest()
         # Retained original startup AST before adding the qualification guard.
         self.assertEqual(digest, 'bb1a13f3d1c74fa36863e2dbe3fa181ea5d141f42e69fcd69a2915e466b7ddd8')
 
