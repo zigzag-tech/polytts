@@ -1198,12 +1198,18 @@ def _synthesis_capabilities():
             engines[name] = {"physical_cancellation": cancellation,
                 "voice_modes": (["registered", "native"] if name == "voxcpm" else ["registered"]),
                 "voice_preprocessing_cancellation": False}
-    return {"runtime": RUNTIME, "engines": engines,
+    capabilities = {"runtime": RUNTIME, "engines": engines,
         # Manager /voices only stores source material; clone prompt extraction
         # is lazy INSIDE the owned synthesis job. MLX registration precomputes.
         "voice_registration_gpu": not _MANAGER_PATH,
         "legacy_http_abort_stops_gpu": False,
         "receipt_persistence": "process_memory", "bounded_physical_cancellation": False}
+    if QUALIFICATION_ONLY:
+        gate = getattr(app.state, 'qualification_gate', None)
+        if gate is None:
+            raise HTTPException(503, 'qualification evidence capability bootstrap absent')
+        capabilities['qualification_evidence'] = {'version':1,'required':True,'binding':dict(gate.binding)}
+    return capabilities
 
 
 def _prepare_owned_synthesis(request, voice_mode):
@@ -1277,8 +1283,14 @@ def _authorize_owned_qualification(submission, fingerprint, authorization):
     def wrap(worker):
         def physical_worker(cancellation):
             cancellation.check()
-            with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_synthesis):
-                return worker(cancellation)
+            proof = None
+            try:
+                with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_synthesis) as proof:
+                    cancellation.record_qualification_evidence({'version':1,'reservation':receipt,'residency':proof})
+                    return worker(cancellation)
+            finally:
+                if proof is not None:
+                    cancellation.record_qualification_evidence({'version':1,'reservation':receipt,'residency':proof})
         return physical_worker
     return wrap
 
