@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "98ec379dfe9391526a8e9dc9c70092615617a165",
+  "revision": "2510fdd2c9f1a0b6e2b7f2f0b4c865587f13ca96",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only closed qualification client constructor/kernel inventory; new sealed constructor, canonical registration, capacity and physical lifecycle require actual qualification"
+  "qualification": "source-only closed client inventory and actual canonical target field; new constructor/registration/capacity/physical lifecycle remain separate"
 }
