@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "f258a6b929075a2203f7b55ee89892f2aabf034e",
+  "revision": "0e38198122a5aece9669029e500269f875288f3e",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only required job residency evidence, entry-compatible activation custody preflight and canonical physical UUID mapping; actual authority, recognized capacity and physical lifecycle remain separate"
+  "qualification": "source-only shared full static startup preflight and required job residency evidence; actual authority, recognized capacity and physical lifecycle remain separate"
 }
