@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "ae8b480f1c5d4f6fe7e280816eb449972581af20",
+  "revision": "59ff2bee2f2af83ae72d031ef806c976c3265e71",
   "export": "zzops/provider-owner",
-  "qualification": "source-only closed qualification client constructor/kernel inventory; new sealed constructor, canonical registration, capacity and physical lifecycle require actual qualification"
+  "qualification": "source-only UTF8 owner-socket bound, retained first-live kernel witness and exact failed-qualifier CAS; new short-root constructor/registration/capacity/physical lifecycle gates remain separate"
 }
