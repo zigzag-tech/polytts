@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "80b97c7bdbbf2cee4aa3e56f5065df70067299b3",
+  "revision": "f258a6b929075a2203f7b55ee89892f2aabf034e",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only trusted executor qualification evidence and required capability marker; actual authority, reservation, residency and physical lifecycle qualification remain separate"
+  "qualification": "source-only required job residency evidence, entry-compatible activation custody preflight and canonical physical UUID mapping; actual authority, recognized capacity and physical lifecycle remain separate"
 }
