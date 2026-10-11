@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "5c1ea4bcb247b42224e1fc897d1999f292726ec2",
+  "revision": "93a3359310956ae40455afc761530303b1f0f626",
   "export": "zzops/provider-owner",
-  "qualification": "source-only registered bounded qualification window and held reverse; no installed provider or inference qualification"
+  "qualification": "source-only distinct qualification policy/source-lock; actual kernel-sealed preparation, registration, capacity and inference remain separate gates"
 }
