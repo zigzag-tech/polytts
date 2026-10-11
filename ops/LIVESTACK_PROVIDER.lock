@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "5461022b82dbe7281bdf93aa7ac5f235d5fcc859",
+  "revision": "3abf98c3e1409c66565f636255e0caac875cb46d",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only qualifier integration; exact fetched wheel/import and CPU controls passed; production pins, CUDA/backend/grants/capacity remain separate gates"
+  "qualification": "source-only explicit paired durable qualification startup; installed wheel CPU controls pass, actual shared registration/capacity/model lifecycle remain separate"
 }
