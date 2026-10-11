@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "59ff2bee2f2af83ae72d031ef806c976c3265e71",
+  "revision": "31e4175cfd4340da6d60433d630c77c6be165b45",
   "export": "zzops/provider-owner",
-  "qualification": "source-only UTF8 owner-socket bound, retained first-live kernel witness and exact failed-qualifier CAS; new short-root constructor/registration/capacity/physical lifecycle gates remain separate"
+  "qualification": "source-only explicit runtime host binding, first kernel observation before peer RPC, and exact terminal failed qualifier recovery; constructor/registration/capacity/physical lifecycle gates remain separate"
 }

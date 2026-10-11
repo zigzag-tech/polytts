@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "e27e3bd4f9cb1a1b7ed301b9e6adff9dca10657f",
+  "revision": "7ca0a37584ffd13a5c88f26b73bd4d71b2f3ec7b",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only UTF8 owner-socket bound, retained first-live kernel witness and exact failed-qualifier CAS; new short-root constructor/registration/capacity/physical lifecycle gates remain separate"
+  "qualification": "source-only explicit runtime host binding, first kernel observation before peer RPC, and exact terminal failed qualifier recovery; constructor/registration/capacity/physical lifecycle gates remain separate"
 }
