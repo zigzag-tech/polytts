@@ -37,6 +37,7 @@ from synthesis_jobs import SynthesisJobs
 from model_paths import resolve_models_dir
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
+QUALIFICATION_ONLY = os.environ.get("POLYTTS_QUALIFICATION_ONLY", "0") == "1"
 
 # Non-MLX runtimes use the multi-engine manager (one model in VRAM at a time,
 # evicted on engine-switch and after idle so the shared GPU is freed). MLX uses
@@ -268,7 +269,7 @@ if _MANAGER_PATH:
                                     in_flight=lambda: _inflight,
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
-                                    preload=lambda: _warm_manager_path())
+                                    preload=None if QUALIFICATION_ONLY else lambda: _warm_manager_path())
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -328,7 +329,7 @@ elif RUNTIME == "mlx":
                                     # attach thread abort the first synthesis on the
                                     # executor ("There is no Stream(cpu, 1) in current
                                     # thread" -> SIGABRT, launchd restart loop).
-                                    preload=lambda: _gpu_call(_warm_mlx))
+                                    preload=None if QUALIFICATION_ONLY else lambda: _gpu_call(_warm_mlx))
     except ImportError:
         manager = None
         residence = None
@@ -936,6 +937,9 @@ def _warm_manager_path() -> None:
 @app.on_event("startup")
 async def startup():
     global manager
+
+    if QUALIFICATION_ONLY:
+        return
 
     # **Nothing that loads a model happens here any more, and the reason is a
     # deadlock rather than a preference.**
