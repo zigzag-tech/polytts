@@ -1176,6 +1176,8 @@ def _gen_chunks(engine_name, req):
 def _synchronize_owned_synthesis():
     """Called only on the shared serial GPU executor, after this job stops."""
     import torch
+    if QUALIFICATION_ONLY and not torch.cuda.is_initialized():
+        return
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -1272,7 +1274,7 @@ def _authorize_owned_qualification(submission, fingerprint, authorization):
     def wrap(worker):
         def physical_worker(cancellation):
             cancellation.check()
-            with gate.work(job,authorization,receipt['fence']):
+            with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_synthesis):
                 return worker(cancellation)
         return physical_worker
     return wrap
