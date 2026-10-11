@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/livestack.git",
-  "revision": "3abf98c3e1409c66565f636255e0caac875cb46d",
+  "revision": "98ec379dfe9391526a8e9dc9c70092615617a165",
   "entry": "livestack_node.provider_entry",
-  "qualification": "source-only explicit paired durable qualification startup; installed wheel CPU controls pass, actual shared registration/capacity/model lifecycle remain separate"
+  "qualification": "source-only closed qualification client constructor/kernel inventory; new sealed constructor, canonical registration, capacity and physical lifecycle require actual qualification"
 }

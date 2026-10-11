@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "c8500a2ecaa64510a3e004e46e48b1b3be2ef507",
+  "revision": "ae8b480f1c5d4f6fe7e280816eb449972581af20",
   "export": "zzops/provider-owner",
-  "qualification": "source-only distinct qualifier unit controls/install CAS; package closure, canonical registration, capacity and physical lifecycle independently required"
+  "qualification": "source-only closed qualification client constructor/kernel inventory; new sealed constructor, canonical registration, capacity and physical lifecycle require actual qualification"
 }
