@@ -1,6 +1,7 @@
 """CPU source wiring controls; no full-server/model qualification."""
 import ast
 import asyncio
+import hashlib
 from pathlib import Path
 import unittest
 
@@ -22,7 +23,22 @@ class QualificationStartupTests(unittest.TestCase):
         self.assertEqual(ast.dump(guard.test), "Name(id='QUALIFICATION_ONLY', ctx=Load())")
         self.assertEqual(len(guard.body), 1)
         self.assertIsInstance(guard.body[0], ast.Return)
-        self.assertGreater(len(startup.body), 3)
+        retained = [node for node in startup.body if node is not guard]
+        digest = hashlib.sha256(ast.dump(ast.Module(body=retained, type_ignores=[]), include_attributes=False).encode()).hexdigest()
+        # Retained original startup AST before adding the qualification guard.
+        self.assertEqual(digest, 'bb1a13f3d1c74fa36863e2dbe3fa181ea5d141f42e69fcd69a2915e466b7ddd8')
+
+
+class PreloadTests(unittest.TestCase):
+    def test_both_attach_preloads_are_disabled_only_for_qualification(self):
+        tree = ast.parse(SOURCE.read_text())
+        preloads = [kw.value for node in ast.walk(tree) if isinstance(node, ast.Call) for kw in node.keywords if kw.arg == "preload"]
+        self.assertEqual(len(preloads), 2)
+        for value in preloads:
+            self.assertIsInstance(value, ast.IfExp)
+            self.assertEqual(ast.dump(value.test), "Name(id='QUALIFICATION_ONLY', ctx=Load())")
+            self.assertIsNone(value.body.value)
+            self.assertIsInstance(value.orelse, ast.Lambda)
 
 if __name__ == "__main__":
     unittest.main()
