@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "git@github.com:zigzag-tech/zzops.git",
-  "revision": "93a3359310956ae40455afc761530303b1f0f626",
+  "revision": "c8500a2ecaa64510a3e004e46e48b1b3be2ef507",
   "export": "zzops/provider-owner",
-  "qualification": "source-only distinct qualification policy/source-lock; actual kernel-sealed preparation, registration, capacity and inference remain separate gates"
+  "qualification": "source-only distinct qualifier unit controls/install CAS; package closure, canonical registration, capacity and physical lifecycle independently required"
 }
