@@ -224,6 +224,15 @@ if _MANAGER_PATH:
     # See openspec/changes/add-dots-tts-engine.
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
                    "cosyvoice": 3_000_000_000, "dots": 8_000_000_000, "indextts25": 16 * 1024**3, "drama3": 21 * 1024**3}
+    # Upstream documents Q3/12 CPU expert layers as a 16GB starting profile
+    # (simulated on96GB hardware). Keep a larger18GiB declared estimate and
+    # the broker's independent reserve; never label this a measured footprint.
+    if "POLYTTS_DRAMA3_DECLARED_VRAM_GIB" in os.environ:
+        drama_budget = int(os.environ["POLYTTS_DRAMA3_DECLARED_VRAM_GIB"])
+        drama_cpu_layers = int(os.environ.get("POLYTTS_DRAMA3_CPU_EXPERT_LAYERS", "8"))
+        if not 18 <= drama_budget <= 24 or (drama_budget < 21 and drama_cpu_layers < 12):
+            raise RuntimeError("Explicit Drama3 CPU-offload/declared budget profile refused")
+        _FOOTPRINTS["drama3"] = drama_budget * 1024**3
 
     _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
 
@@ -1589,6 +1598,12 @@ def _install_owned_jobs():
             "nativeSourceCommit": "POLYTTS_DRAMA3_SOURCE_REVISION", "nativeOutputPatchSha256": "POLYTTS_DRAMA3_METADATA_PATCH_SHA256"}
         if any(config["sourceIdentity"].get(key) != os.environ.get(variable) for key, variable in bindings.items()):
             raise RuntimeError("Installed native Drama3 source/runtime tuple differs")
+        if "POLYTTS_DRAMA3_DECLARED_VRAM_GIB" in os.environ:
+            profile = {"cpuExpertLayers": int(os.environ["POLYTTS_DRAMA3_CPU_EXPERT_LAYERS"]),
+                "contextLength": int(os.environ["POLYTTS_DRAMA3_CONTEXT_LENGTH"]),
+                "declaredVramBytes": _FOOTPRINTS["drama3"]}
+            if config["sourceIdentity"].get("nativeSessionProfile") != profile:
+                raise RuntimeError("Installed Drama3 session/admission profile differs")
 
     def validate(body):
         if not isinstance(body, dict) or body.get("engine") not in {"indextts25", "drama3"} or body["engine"] not in _ENGINES:
