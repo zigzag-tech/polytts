@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, IndexTts25Engine, pcm16
+from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, IndexTts25Engine, Drama3Engine, pcm16
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -51,7 +51,7 @@ DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
 # Engines whose non-x-vector cloning path consumes the reference TRANSCRIPT,
 # so a blank ref_text cannot serve it. cosyvoice is absent deliberately: its
 # sidecar passes ref_text straight through and tolerates an empty one.
-_NEEDS_REF_TEXT = frozenset({"qwen", "dots"})
+_NEEDS_REF_TEXT = frozenset({"qwen", "dots", "drama3"})
 
 # Cap in-memory voice caches so that registering thousands of unique voices
 # cannot grow memory without bound.  Evicted voices remain on disk and are
@@ -216,7 +216,7 @@ if _MANAGER_PATH:
     # that disqualified the heavier dots.tts-soar checkpoint beside polyasr.
     # See openspec/changes/add-dots-tts-engine.
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
-                   "cosyvoice": 3_000_000_000, "dots": 8_000_000_000, "indextts25": 16 * 1024**3}
+                   "cosyvoice": 3_000_000_000, "dots": 8_000_000_000, "indextts25": 16 * 1024**3, "drama3": 21 * 1024**3}
 
     _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
 
@@ -243,12 +243,15 @@ if _MANAGER_PATH:
                               "model": "IndexTeam/IndexTTS-2.5", "sample_rate": 22050,
                               "revision": os.environ.get("POLYTTS_INDEXTTS25_REVISION"),
                               "languages": ["en", "zh", "ja", "es", "ar"],
-                              "max_concurrent": 1} if name == "indextts25" else {}),
+                              "max_concurrent": 1} if name == "indextts25" else
+                               {"class": "tts", "task": "text_to_speech", "model": "fishaudio/drama-3",
+                                "sample_rate": 44100, "revision": os.environ.get("POLYTTS_DRAMA3_MODEL_REVISION"),
+                                "languages": ["en"], "max_concurrent": 1} if name == "drama3" else {}),
                            residency_policy=(getattr(ResidencyPolicy, _DEFAULT_RESIDENCY)
                                              if pin else ResidencyPolicy.UNPINNED))
 
     _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
-                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine(), "indextts25": IndexTts25Engine()}
+                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine(), "indextts25": IndexTts25Engine(), "drama3": Drama3Engine()}
     if os.environ.get("POLYTTS_ENABLED_ENGINES"):
         enabled = set(os.environ["POLYTTS_ENABLED_ENGINES"].split(","))
         if not enabled <= _ENGINES.keys() or DEFAULT_ENGINE not in enabled:
@@ -1151,6 +1154,7 @@ class TTSRequest(BaseModel):
     interval_silence_ms: int | None = None
     max_text_tokens_per_segment: int | None = None
     seed: int | None = None
+    drama_controls: dict | None = None
 
 
 def _generation_kwargs(req: TTSRequest) -> dict:
@@ -1167,7 +1171,7 @@ def _generation_kwargs(req: TTSRequest) -> dict:
         "inference_timesteps",
         "denoise",
         "instruct", "duration_factor", "emotion_alpha", "emotion_vector",
-        "interval_silence_ms", "max_text_tokens_per_segment", "seed",
+        "interval_silence_ms", "max_text_tokens_per_segment", "seed", "drama_controls",
     )
     return {key: getattr(req, key) for key in fields if getattr(req, key) is not None}
 
@@ -1564,7 +1568,7 @@ def _install_owned_jobs():
     if not _MANAGER_PATH or residence is None:
         raise RuntimeError("Managed speech requires the actual Harmony coordinator")
     from livestack_node.tts.jobs import install_managed_tts_jobs
-    from livestack_node.tts.protocol import validate_request
+    from livestack_node.tts.protocol import validate_request, validate_base_request
     config = json.loads(Path(configuration).read_text())
     import torch
     actual_uuid = str(torch.cuda.get_device_properties(0).uuid).removeprefix("GPU-")
@@ -1574,9 +1578,16 @@ def _install_owned_jobs():
         raise RuntimeError("Pinned model inventory changed")
 
     def validate(body):
-        if not isinstance(body, dict) or body.get("engine") != "indextts25" or body["engine"] not in _ENGINES:
+        if not isinstance(body, dict) or body.get("engine") not in {"indextts25", "drama3"} or body["engine"] not in _ENGINES:
             raise ValueError("Explicit installed PolyTTS engine required")
-        validate_request({key: value for key, value in body.items() if key != "engine"})
+        core = {key: value for key, value in body.items() if key != "engine"}
+        if body["engine"] == "indextts25":
+            validate_request(core)
+        else:
+            validate_base_request(core)
+            if body["language"] != "en":
+                raise ValueError("This Drama3 profile qualifies English only")
+            Drama3Engine.validate_controls(body["controls"])
         return body
 
     def prepare(body):
@@ -1594,33 +1605,62 @@ def _install_owned_jobs():
         if cancel.is_set():
             raise InterruptedError("Cancelled before native PolyTTS synthesis")
         c = body["controls"]
-        kwargs = {"duration_factor": c["durationFactor"], "emotion_alpha": c["emotionAlpha"],
-            "interval_silence_ms": c["intervalSilenceMs"], "max_text_tokens_per_segment": c["maxTextTokensPerSegment"],
-            "seed": c["seed"]}
-        if "emotionVector" in c:
-            kwargs["emotion_vector"] = c["emotionVector"]
+        if body["engine"] == "indextts25":
+            kwargs = {"duration_factor": c["durationFactor"], "emotion_alpha": c["emotionAlpha"],
+                "interval_silence_ms": c["intervalSilenceMs"], "max_text_tokens_per_segment": c["maxTextTokensPerSegment"],
+                "seed": c["seed"]}
+            if "emotionVector" in c:
+                kwargs["emotion_vector"] = c["emotionVector"]
+        else:
+            kwargs = c
         torch.cuda.reset_peak_memory_stats()
         audio, sr, warnings = engine.generate_native(body["text"], body["voiceId"], entry["dir"], entry["meta"], body["language"], kwargs)
         if cancel.is_set():
             raise InterruptedError("Cancellation joined native PolyTTS synthesis")
         target = path / "audio.wav"
-        sf.write(target, audio, sr, subtype="PCM_16")
+        encoding = "PCM_16" if audio.dtype == np.int16 else "FLOAT"
+        sf.write(target, audio, sr, subtype=encoding)
+        retained_artifacts = []
+        if hasattr(engine, "take_artifacts"):
+            for item in engine.take_artifacts():
+                if item["id"] != "drama3_take" or item["kind"] != 3:
+                    raise RuntimeError("Unexpected native Drama3 artifact identity")
+                # Retain original token bytes; no code-grid repair or regeneration.
+                json.loads(item["payload"])
+                artifact_path = path / "drama3-take.json"
+                artifact_path.write_bytes(item["payload"])
+                retained_artifacts.append({"name": artifact_path.name, "sha256": hashlib.sha256(item["payload"]).hexdigest(), "bytes": len(item["payload"]), "kind": item["kind"], "id": item["id"]})
         payload = target.read_bytes()
         return {"audio": {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload),
-            "sampleRate": sr, "channels": 1, "frames": len(audio), "durationSeconds": len(audio) / sr},
+            "sampleRate": sr, "channels": 1, "frames": len(audio), "durationSeconds": len(audio) / sr, "encoding": encoding},
             "model": {"engine": body["engine"], "model": engine.model_name,
-                "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"]},
-            "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
+                "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"] if body["engine"] == "indextts25" else os.environ["POLYTTS_DRAMA3_MODEL_REVISION"],
+                **({"quantization": "Q3_K experts/Q8_0 backbone/FP16 audio", "modelSha256": os.environ["POLYTTS_DRAMA3_MODEL_SHA256"]} if body["engine"] == "drama3" else {})},
+            "nativeRuntime": ({"implementation": "audio.cpp C ABI0.2", "librarySha256": os.environ["POLYTTS_DRAMA3_LIBRARY_SHA256"],
+                "sourceRevision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"], "cudaAllocationsOutsideTorchAllocator": True,
+                "cpuExpertLayers": int(os.environ.get("POLYTTS_DRAMA3_CPU_EXPERT_LAYERS", "8")),
+                "contextLength": int(os.environ.get("POLYTTS_DRAMA3_CONTEXT_LENGTH", "2048"))} if body["engine"] == "drama3" else {"implementation": "IndexTTS2.5 native PyTorch"}),
+            "artifacts": retained_artifacts, "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
             "referenceSha256": body["referenceSha256"], "warnings": warnings,
             "torchPeakAllocatedBytes": torch.cuda.max_memory_allocated(),
             "torchPeakReservedBytes": torch.cuda.max_memory_reserved()}
 
     def capabilities():
-        return {"engines": {"indextts25": {"model": "IndexTeam/IndexTTS-2.5",
-            "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"], "sample_rate": 22050,
-            "channels": 1, "emotion_vector": True, "emotion_text": False,
-            "duration_factor": {"min": .5, "max": 2, "exact_seconds": False},
-            "interruptible_inference": False}}, "voices": [{"id": key, "sha256": value["sha256"],
+        engines = {}
+        if "indextts25" in _ENGINES:
+            engines["indextts25"] = {"model": "IndexTeam/IndexTTS-2.5",
+                "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"], "sample_rate": 22050,
+                "channels": 1, "emotion_vector": True, "emotion_text": False,
+                "duration_factor": {"min": .5, "max": 2, "exact_seconds": False},
+                "interruptible_inference": False}
+        if "drama3" in _ENGINES:
+            engines["drama3"] = {"model": "fishaudio/drama-3", "revision": os.environ["POLYTTS_DRAMA3_MODEL_REVISION"],
+                "model_sha256": os.environ["POLYTTS_DRAMA3_MODEL_SHA256"], "quantization": "Q3_K experts/Q8_0 backbone/FP16 audio",
+                "implementation": "audio.cpp community native GGML port", "implementation_revision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"],
+                "sample_rate": 44100, "channels": 1, "languages": ["en"], "inline_event_tags": True,
+                "previous_takes_vq_history": True, "native_take_artifact": True, "exact_seconds": False,
+                "interruptible_inference": False, "license": "Fish Audio Community License1.0"}
+        return {"engines": engines, "voices": [{"id": key, "sha256": value["sha256"],
                 "origin": value["origin"]} for key, value in config["voices"].items()]}
 
     install_managed_tts_jobs(app, config, manager=manager, coordinator=residence,

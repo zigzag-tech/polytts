@@ -171,6 +171,103 @@ class IndexTts25Engine(Engine):
         return audio.astype(np.float32) / 32768.0, sr
 
 
+class Drama3Engine(Engine):
+    """Exact Fish Audio Drama3 via the upstream audio.cpp community GGML port."""
+    name = "drama3"
+    sample_rate = 44100
+
+    def __init__(self):
+        self._session = None
+        self.model_name = "fishaudio/drama-3"
+        self._artifacts = []
+
+    @property
+    def loaded(self):
+        return self._session is not None
+
+    def load(self):
+        import torch
+        from audio_cpp import NativeAudioSession
+        if not torch.cuda.is_available():
+            raise RuntimeError("The configured Drama3 backend requires CUDA")
+        model = Path(os.environ["POLYTTS_DRAMA3_MODEL"]).resolve(strict=True)
+        library = Path(os.environ["POLYTTS_DRAMA3_LIBRARY"]).resolve(strict=True)
+        for path, expected in [(model, os.environ["POLYTTS_DRAMA3_MODEL_SHA256"]),
+                               (library, os.environ["POLYTTS_DRAMA3_LIBRARY_SHA256"])]:
+            digest = hashlib.sha256()
+            with path.open('rb') as stream:
+                for block in iter(lambda: stream.read(8*1024*1024), b''):
+                    digest.update(block)
+            if digest.hexdigest() != expected:
+                raise RuntimeError("Pinned native Drama3 model/library bytes changed")
+        cpu_layers = int(os.environ.get("POLYTTS_DRAMA3_CPU_EXPERT_LAYERS", "8"))
+        context = int(os.environ.get("POLYTTS_DRAMA3_CONTEXT_LENGTH", "2048"))
+        if not 0 <= cpu_layers <= 40 or context not in (2048, 4096, 8192):
+            raise RuntimeError("Closed Drama3 session profile refused")
+        self._session = NativeAudioSession(library, model, family="fish_drama3",
+            session_options={"fish_drama3.cpu_expert_layers": cpu_layers,
+                             "fish_drama3.context_length": context}, threads=4)
+        torch.cuda.synchronize()
+
+    def unload(self):
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+        self._artifacts = []
+        gc.collect()
+        _free_cuda()
+
+    @staticmethod
+    def validate_controls(controls):
+        import math
+        required = {"temperature", "topP", "topK", "maxTokens", "seed", "textChunkSize"}
+        if not isinstance(controls, dict) or not required <= controls.keys() or controls.keys() - required - {"previousTakes"}:
+            raise ValueError("Closed explicit Drama3 controls required")
+        for key, low, high in [("temperature", .1, 2), ("topP", .01, 1)]:
+            value = controls[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError("Native Drama3 sampling bound refused")
+        for key, low, high in [("topK", 1, 4097), ("maxTokens", 32, 2048), ("seed", 0, 2**32-1), ("textChunkSize", 32, 4096)]:
+            if type(controls[key]) is not int or not low <= controls[key] <= high:
+                raise ValueError("Native Drama3 integer control refused")
+        previous = controls.get("previousTakes", [])
+        if not isinstance(previous, list) or len(previous) > 4:
+            raise ValueError("Bounded explicit Drama3 take history required")
+        for take in previous:
+            if not isinstance(take, dict) or set(take) != {"text", "vqCodes"} or not isinstance(take["text"], str) or not 1 <= len(take["text"]) <= 4000:
+                raise ValueError("Drama3 history accepts exact text and VQ codes, never server paths")
+            grid = take["vqCodes"]
+            if not isinstance(grid, list) or len(grid) != 10 or not isinstance(grid[0], list) or not 1 <= len(grid[0]) <= 2048:
+                raise ValueError("Ten bounded native codebooks required")
+            if any(not isinstance(row, list) or len(row) != len(grid[0]) or any(type(value) is not int or not 0 <= value < 2**31 for value in row) for row in grid):
+                raise ValueError("Malformed native codebook history")
+        return controls
+
+    def generate_native(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        import json
+        import torch
+        controls = self.validate_controls(gen_kwargs.get("drama_controls", gen_kwargs))
+        reference, rate = sf.read(voice_dir / "voice.wav", dtype="float32")
+        options = {"temperature": controls["temperature"], "top_p": controls["topP"],
+            "top_k": controls["topK"], "max_tokens": controls["maxTokens"], "seed": controls["seed"],
+            "text_chunk_size": controls["textChunkSize"], "text_chunk_mode": "tag_aware",
+            "reference_text": meta["ref_text"]}
+        if "previousTakes" in controls:
+            options["previous_takes"] = json.dumps([{"text": take["text"], "vq_codes": take["vqCodes"]} for take in controls["previousTakes"]], separators=(",", ":"), ensure_ascii=False)
+        audio, rate, artifacts = self._session.run(text, language or "en", reference, rate, options)
+        torch.cuda.synchronize()
+        self._artifacts = artifacts
+        return audio, rate, []
+
+    def take_artifacts(self):
+        result, self._artifacts = self._artifacts, []
+        return result
+
+    def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        audio, rate, _ = self.generate_native(text, voice_id, voice_dir, meta, language, gen_kwargs)
+        return audio, rate
+
+
 # ---------------------------------------------------------------------------
 # Qwen3-TTS engine (pytorch)
 # ---------------------------------------------------------------------------
