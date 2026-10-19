@@ -26,7 +26,7 @@ import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 import cache
@@ -92,6 +92,13 @@ MAX_SENTENCES_PER_GEN = {
 }
 
 app = FastAPI(title="PolyTTS Server")
+
+@app.middleware("http")
+async def owned_inference_only(request, call_next):
+    if os.environ.get("POLYTTS_MANAGED_JOBS_CONFIG") and request.url.path.rstrip("/") in {"/tts", "/tts/stream"}:
+        return JSONResponse({"detail": "This managed instance requires an owned Harmony TTS job"}, status_code=403)
+    return await call_next(request)
+
 from livestack_node import counting
 _managed_busy = counting()
 
@@ -1567,7 +1574,7 @@ def _install_owned_jobs():
         return
     if not _MANAGER_PATH or residence is None:
         raise RuntimeError("Managed speech requires the actual Harmony coordinator")
-    from livestack_node.tts.jobs import install_managed_tts_jobs
+    from livestack_node.tts.jobs import install_managed_tts_jobs, read_owned_speech_take
     from livestack_node.tts.protocol import validate_request, validate_base_request
     config = json.loads(Path(configuration).read_text())
     import torch
@@ -1576,6 +1583,12 @@ def _install_owned_jobs():
         raise RuntimeError("Actual physical CUDA device differs from installed configuration")
     if hashlib.sha256(Path(config["modelManifestPath"]).read_bytes()).hexdigest() != config["modelManifestSha256"]:
         raise RuntimeError("Pinned model inventory changed")
+    if "drama3" in _ENGINES:
+        bindings = {"nativeLibrarySha256": "POLYTTS_DRAMA3_LIBRARY_SHA256",
+            "modelArtifactSha256": "POLYTTS_DRAMA3_MODEL_SHA256", "modelRevision": "POLYTTS_DRAMA3_MODEL_REVISION",
+            "nativeSourceCommit": "POLYTTS_DRAMA3_SOURCE_REVISION", "nativeOutputPatchSha256": "POLYTTS_DRAMA3_METADATA_PATCH_SHA256"}
+        if any(config["sourceIdentity"].get(key) != os.environ.get(variable) for key, variable in bindings.items()):
+            raise RuntimeError("Installed native Drama3 source/runtime tuple differs")
 
     def validate(body):
         if not isinstance(body, dict) or body.get("engine") not in {"indextts25", "drama3"} or body["engine"] not in _ENGINES:
@@ -1598,6 +1611,16 @@ def _install_owned_jobs():
         reference = entry["dir"] / "voice.wav"
         if hashlib.sha256(reference.read_bytes()).hexdigest() != body["referenceSha256"]:
             raise ValueError("Registered reference bytes changed")
+        if body["engine"] == "drama3" and hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest() != allowed.get("referenceTextSha256"):
+            raise ValueError("Registered reference transcript identity changed")
+        entry = dict(entry)
+        resolved, proofs = [], []
+        if body["engine"] == "drama3":
+            for reference in body["controls"].get("history", []):
+                take, proof = read_owned_speech_take(config, body, reference)
+                resolved.append(take)
+                proofs.append(proof)
+        entry["resolvedHistory"], entry["historyProofs"] = resolved, proofs
         return entry
 
     def generate(engine, body, path, cancel):
@@ -1612,7 +1635,7 @@ def _install_owned_jobs():
             if "emotionVector" in c:
                 kwargs["emotion_vector"] = c["emotionVector"]
         else:
-            kwargs = c
+            kwargs = {"controls": c, "resolvedHistory": entry["resolvedHistory"]}
         torch.cuda.reset_peak_memory_stats()
         audio, sr, warnings = engine.generate_native(body["text"], body["voiceId"], entry["dir"], entry["meta"], body["language"], kwargs)
         if cancel.is_set():
@@ -1623,11 +1646,12 @@ def _install_owned_jobs():
         retained_artifacts = []
         if hasattr(engine, "take_artifacts"):
             for item in engine.take_artifacts():
-                if item["id"] != "drama3_take" or item["kind"] != 3:
+                allowed = {"drama3_take": (3, "drama3-take.json"), "drama3_generation": (8, "drama3-generation.json")}
+                if item["id"] not in allowed or item["kind"] != allowed[item["id"]][0]:
                     raise RuntimeError("Unexpected native Drama3 artifact identity")
                 # Retain original token bytes; no code-grid repair or regeneration.
                 json.loads(item["payload"])
-                artifact_path = path / "drama3-take.json"
+                artifact_path = path / allowed[item["id"]][1]
                 artifact_path.write_bytes(item["payload"])
                 retained_artifacts.append({"name": artifact_path.name, "sha256": hashlib.sha256(item["payload"]).hexdigest(), "bytes": len(item["payload"]), "kind": item["kind"], "id": item["id"]})
         payload = target.read_bytes()
@@ -1637,11 +1661,12 @@ def _install_owned_jobs():
                 "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"] if body["engine"] == "indextts25" else os.environ["POLYTTS_DRAMA3_MODEL_REVISION"],
                 **({"quantization": "Q3_K experts/Q8_0 backbone/FP16 audio", "modelSha256": os.environ["POLYTTS_DRAMA3_MODEL_SHA256"]} if body["engine"] == "drama3" else {})},
             "nativeRuntime": ({"implementation": "audio.cpp C ABI0.2", "librarySha256": os.environ["POLYTTS_DRAMA3_LIBRARY_SHA256"],
-                "sourceRevision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"], "cudaAllocationsOutsideTorchAllocator": True,
+                "sourceRevision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"], "generationMetadataPatchSha256": os.environ["POLYTTS_DRAMA3_METADATA_PATCH_SHA256"], "cudaAllocationsOutsideTorchAllocator": True,
                 "cpuExpertLayers": int(os.environ.get("POLYTTS_DRAMA3_CPU_EXPERT_LAYERS", "8")),
                 "contextLength": int(os.environ.get("POLYTTS_DRAMA3_CONTEXT_LENGTH", "2048"))} if body["engine"] == "drama3" else {"implementation": "IndexTTS2.5 native PyTorch"}),
-            "artifacts": retained_artifacts, "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
-            "referenceSha256": body["referenceSha256"], "warnings": warnings,
+            "historySources": entry["historyProofs"], "artifacts": retained_artifacts, "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
+            "referenceSha256": body["referenceSha256"],
+            "referenceTextSha256": hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest(), "warnings": warnings,
             "torchPeakAllocatedBytes": torch.cuda.max_memory_allocated(),
             "torchPeakReservedBytes": torch.cuda.max_memory_reserved()}
 
@@ -1658,7 +1683,7 @@ def _install_owned_jobs():
                 "model_sha256": os.environ["POLYTTS_DRAMA3_MODEL_SHA256"], "quantization": "Q3_K experts/Q8_0 backbone/FP16 audio",
                 "implementation": "audio.cpp community native GGML port", "implementation_revision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"],
                 "sample_rate": 44100, "channels": 1, "languages": ["en"], "inline_event_tags": True,
-                "previous_takes_vq_history": True, "native_take_artifact": True, "exact_seconds": False,
+                "owned_previous_take_history": True, "native_take_artifact": True, "exact_seconds": False,
                 "interruptible_inference": False, "license": "Fish Audio Community License1.0"}
         return {"engines": engines, "voices": [{"id": key, "sha256": value["sha256"],
                 "origin": value["origin"]} for key, value in config["voices"].items()]}

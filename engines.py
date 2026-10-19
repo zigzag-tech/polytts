@@ -221,41 +221,58 @@ class Drama3Engine(Engine):
     def validate_controls(controls):
         import math
         required = {"temperature", "topP", "topK", "maxTokens", "seed", "textChunkSize"}
-        if not isinstance(controls, dict) or not required <= controls.keys() or controls.keys() - required - {"previousTakes"}:
+        if not isinstance(controls, dict) or not required <= controls.keys() or controls.keys() - required - {"history"}:
             raise ValueError("Closed explicit Drama3 controls required")
-        for key, low, high in [("temperature", .1, 2), ("topP", .01, 1)]:
+        for key, low, high in [("temperature", 0, 2), ("topP", 0, 1)]:
             value = controls[key]
             if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
                 raise ValueError("Native Drama3 sampling bound refused")
         for key, low, high in [("topK", 1, 4097), ("maxTokens", 32, 2048), ("seed", 0, 2**32-1), ("textChunkSize", 32, 4096)]:
             if type(controls[key]) is not int or not low <= controls[key] <= high:
                 raise ValueError("Native Drama3 integer control refused")
-        previous = controls.get("previousTakes", [])
-        if not isinstance(previous, list) or len(previous) > 4:
-            raise ValueError("Bounded explicit Drama3 take history required")
-        for take in previous:
-            if not isinstance(take, dict) or set(take) != {"text", "vqCodes"} or not isinstance(take["text"], str) or not 1 <= len(take["text"]) <= 4000:
-                raise ValueError("Drama3 history accepts exact text and VQ codes, never server paths")
-            grid = take["vqCodes"]
-            if not isinstance(grid, list) or len(grid) != 10 or not isinstance(grid[0], list) or not 1 <= len(grid[0]) <= 2048:
-                raise ValueError("Ten bounded native codebooks required")
-            if any(not isinstance(row, list) or len(row) != len(grid[0]) or any(type(value) is not int or not 0 <= value < 2**31 for value in row) for row in grid):
-                raise ValueError("Malformed native codebook history")
+        import re
+        history = controls.get("history", [])
+        if not isinstance(history, list) or len(history) > 4:
+            raise ValueError("Bounded explicit retained Drama3 history required")
+        for take in history:
+            if not isinstance(take, dict) or set(take) != {"jobId", "requestSha256", "takeSha256"}:
+                raise ValueError("History requires exact owned job/request/artifact identities")
+            if not isinstance(take["jobId"], str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}", take["jobId"]):
+                raise ValueError("Retained history job ID refused")
+            if any(not isinstance(take[key], str) or not re.fullmatch(r"[a-f0-9]{64}", take[key]) for key in ("requestSha256", "takeSha256")):
+                raise ValueError("Exact retained history digests required")
         return controls
 
     def generate_native(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
         import json
         import torch
-        controls = self.validate_controls(gen_kwargs.get("drama_controls", gen_kwargs))
+        envelope = gen_kwargs if set(gen_kwargs) == {"controls", "resolvedHistory"} else None
+        controls = self.validate_controls(envelope["controls"] if envelope else gen_kwargs.get("drama_controls", gen_kwargs))
+        history = envelope["resolvedHistory"] if envelope else []
+        if len(history) != len(controls.get("history", [])):
+            raise ValueError("History requires the actual owned managed-job resolver")
         reference, rate = sf.read(voice_dir / "voice.wav", dtype="float32")
         options = {"temperature": controls["temperature"], "top_p": controls["topP"],
             "top_k": controls["topK"], "max_tokens": controls["maxTokens"], "seed": controls["seed"],
             "text_chunk_size": controls["textChunkSize"], "text_chunk_mode": "tag_aware",
             "reference_text": meta["ref_text"]}
-        if "previousTakes" in controls:
-            options["previous_takes"] = json.dumps([{"text": take["text"], "vq_codes": take["vqCodes"]} for take in controls["previousTakes"]], separators=(",", ":"), ensure_ascii=False)
+        if history:
+            options["previous_takes"] = json.dumps(history, separators=(",", ":"), ensure_ascii=False)
         audio, rate, artifacts = self._session.run(text, language or "en", reference, rate, options)
         torch.cuda.synchronize()
+        proofs = [item for item in artifacts if item["id"] == "drama3_generation" and item["kind"] == 8]
+        if len(proofs) != 1:
+            raise RuntimeError("Authoritative native generation metadata missing")
+        proof = json.loads(proofs[0]["payload"])
+        if set(proof) != {"frames", "reached_limit", "wall_ms"} or proof["reached_limit"] is not False:
+            raise RuntimeError("Native Drama3 frame-limit or malformed completion refused")
+        takes = [item for item in artifacts if item["id"] == "drama3_take" and item["kind"] == 3]
+        if len(takes) != 1:
+            raise RuntimeError("Exact native continuation output missing")
+        take = json.loads(takes[0]["payload"])
+        grid = take.get("vq_codes")
+        if take.get("text") != text or not isinstance(grid, list) or len(grid) != 10 or not isinstance(grid[0], list) or len(grid[0]) != proof["frames"] or any(not isinstance(row, list) or len(row) != len(grid[0]) for row in grid):
+            raise RuntimeError("Native take/generation/source correlation refused")
         self._artifacts = artifacts
         return audio, rate, []
 

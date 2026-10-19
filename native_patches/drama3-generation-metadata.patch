@@ -1,0 +1,17 @@
+--- a/src/community_models/fish_drama3/session.cpp
++++ b/src/community_models/fish_drama3/session.cpp
+@@ -238,6 +238,14 @@
+         {"frames", json::Value::make_number(take.codes.frames)},
+         {"reached_limit", json::Value::make_bool(limited)},
+         {"wall_ms", json::Value::make_number(wall_ms)}})};
++    // Preserve authoritative native completion metadata through C ABI artifacts.
++    // This does not change sampling, generated codes, audio or stop decisions.
++    result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
++        "drama3_generation", json::stringify(json::Value::make_object({
++            {"frames", json::Value::make_number(take.codes.frames)},
++            {"reached_limit", json::Value::make_bool(limited)},
++            {"wall_ms", json::Value::make_number(wall_ms)}})),
++        {{"family", "fish_drama3"}, {"schema", "drama3_generation_v1"}}));
+     return result;
+ }
+ 

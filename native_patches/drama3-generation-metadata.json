@@ -1,0 +1,9 @@
+{
+  "upstreamCommit": "ccdbe76929e8a77428db6ec3bbbaadeb35acae38",
+  "file": "src/community_models/fish_drama3/session.cpp",
+  "beforeSha256": "9995c374c258968d38a5422de7fe329bfe720688ac7203f7e6af2874ee406089",
+  "afterSha256": "24411976d079910c1fcf050a5c833dca7f65f4c82caf0cc232cd356b31be1eed",
+  "patchSha256": "3efd2179bac6e43c6a86f28d43ba7603ec4ae122dec42c3bab33925c84841c6b",
+  "changesInference": false,
+  "purpose": "Expose the actual native reached_limit decision through the existing C ABI acoustic artifact channel"
+}
