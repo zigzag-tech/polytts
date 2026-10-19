@@ -19,7 +19,7 @@ class BackendConfig(C.Structure):
 
 
 class NativeAudioSession:
-    def __init__(self, library, model, *, family, session_options, threads=4):
+    def __init__(self, library, model, *, family, session_options, threads=4, task="clon"):
         self.lib = C.CDLL(str(Path(library).resolve(strict=True)))
         self.registry = C.c_void_p()
         self.model = C.c_void_p()
@@ -64,12 +64,12 @@ class NativeAudioSession:
             self.check(self.lib.audiocpp_model_load(self.registry, str(Path(model).resolve(strict=True)).encode(), C.byref(config), None, C.byref(self.model)))
             if self.lib.audiocpp_model_family(self.model).decode() != family:
                 raise RuntimeError('The actual native model family differs; substitution refused')
-            if self.lib.audiocpp_model_supports(self.model, b'clon', b'offline') != 1:
-                raise RuntimeError('Native reference-conditioned offline generation unsupported')
+            if task not in {"tts", "clon"} or self.lib.audiocpp_model_supports(self.model, task.encode(), b'offline') != 1:
+                raise RuntimeError('Explicit native offline speech task unsupported')
             for key, value in session_options.items():
                 self.check(self.lib.audiocpp_options_set(options, key.encode(), str(value).encode()))
             backend = BackendConfig(b'cuda', 0, threads)
-            self.check(self.lib.audiocpp_session_create(self.model, b'clon', b'offline', C.byref(backend), options, C.byref(self.session)))
+            self.check(self.lib.audiocpp_session_create(self.model, task.encode(), b'offline', C.byref(backend), options, C.byref(self.session)))
         except BaseException:
             self.close()
             raise
@@ -87,10 +87,13 @@ class NativeAudioSession:
         try:
             self.check(self.lib.audiocpp_request_set_text(request, text.encode(), None))
             self.check(self.lib.audiocpp_request_set_text_language(request, language.encode()))
-            reference = np.ascontiguousarray(reference, dtype=np.float32)
-            if reference.ndim != 1 or not len(reference) or not np.isfinite(reference).all():
-                raise ValueError('Explicit finite mono reference required')
-            self.check(self.lib.audiocpp_request_set_voice_audio(request, reference.ctypes.data_as(C.POINTER(C.c_float)), len(reference), reference_rate, 1))
+            if reference is not None:
+                reference = np.ascontiguousarray(reference, dtype=np.float32)
+                if reference.ndim != 1 or not len(reference) or not np.isfinite(reference).all():
+                    raise ValueError('Explicit finite mono reference required')
+                self.check(self.lib.audiocpp_request_set_voice_audio(request, reference.ctypes.data_as(C.POINTER(C.c_float)), len(reference), reference_rate, 1))
+            elif reference_rate is not None or "reference_text" in options:
+                raise ValueError('Unconditioned mode must contain no reference data/transcript')
             for key, value in options.items():
                 self.check(self.lib.audiocpp_request_set_option(request, key.encode(), str(value).encode()))
             self.check(self.lib.audiocpp_session_run(self.session, request, C.byref(result)))

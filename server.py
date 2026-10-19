@@ -1593,6 +1593,11 @@ def _install_owned_jobs():
     if hashlib.sha256(Path(config["modelManifestPath"]).read_bytes()).hexdigest() != config["modelManifestSha256"]:
         raise RuntimeError("Pinned model inventory changed")
     if "drama3" in _ENGINES:
+        if config["sourceIdentity"].get("nativeSessionTask") != "tts":
+            raise RuntimeError("Installed Drama3 native TTS task identity differs")
+        owners = config.get("unconditionedOwnerIds", [])
+        if not isinstance(owners, list) or any(not isinstance(owner, str) or not owner or not any(owner.startswith(prefix) for prefix in config["allowedOwnerPrefixes"]) for owner in owners):
+            raise RuntimeError("Explicit installed unconditioned owner scopes required")
         bindings = {"nativeLibrarySha256": "POLYTTS_DRAMA3_LIBRARY_SHA256",
             "modelArtifactSha256": "POLYTTS_DRAMA3_MODEL_SHA256", "modelRevision": "POLYTTS_DRAMA3_MODEL_REVISION",
             "nativeSourceCommit": "POLYTTS_DRAMA3_SOURCE_REVISION", "nativeOutputPatchSha256": "POLYTTS_DRAMA3_METADATA_PATCH_SHA256"}
@@ -1612,22 +1617,28 @@ def _install_owned_jobs():
         if body["engine"] == "indextts25":
             validate_request(core)
         else:
-            validate_base_request(core)
+            validate_base_request(core, unconditioned=body.get("voiceMode") == "unconditioned")
             if body["language"] != "en":
                 raise ValueError("This Drama3 profile qualifies English only")
             Drama3Engine.validate_controls(body["controls"])
         return body
 
     def prepare(body):
-        name, entry = _resolve_engine(body["engine"], body["voiceId"])
-        allowed = config["voices"].get(body["voiceId"])
-        if not entry or entry["engine"] != name or not allowed or allowed["sha256"] != body["referenceSha256"]:
-            raise ValueError("Installed engine/reference identity refused")
-        reference = entry["dir"] / "voice.wav"
-        if hashlib.sha256(reference.read_bytes()).hexdigest() != body["referenceSha256"]:
-            raise ValueError("Registered reference bytes changed")
-        if body["engine"] == "drama3" and hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest() != allowed.get("referenceTextSha256"):
-            raise ValueError("Registered reference transcript identity changed")
+        unconditioned = body.get("voiceMode") == "unconditioned"
+        if unconditioned:
+            if body["engine"] != "drama3" or body["ownerId"] not in config.get("unconditionedOwnerIds", []):
+                raise ValueError("Installed unconditioned owner permission absent")
+            entry = {"engine": "drama3", "dir": None, "meta": {}}
+        else:
+            name, entry = _resolve_engine(body["engine"], body["voiceId"])
+            allowed = config["voices"].get(body["voiceId"])
+            if not entry or entry["engine"] != name or not allowed or allowed["sha256"] != body["referenceSha256"]:
+                raise ValueError("Installed engine/reference identity refused")
+            reference = entry["dir"] / "voice.wav"
+            if hashlib.sha256(reference.read_bytes()).hexdigest() != body["referenceSha256"]:
+                raise ValueError("Registered reference bytes changed")
+            if body["engine"] == "drama3" and hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest() != allowed.get("referenceTextSha256"):
+                raise ValueError("Registered reference transcript identity changed")
         entry = dict(entry)
         resolved, proofs = [], []
         if body["engine"] == "drama3":
@@ -1650,9 +1661,18 @@ def _install_owned_jobs():
             if "emotionVector" in c:
                 kwargs["emotion_vector"] = c["emotionVector"]
         else:
-            kwargs = {"controls": c, "resolvedHistory": entry["resolvedHistory"]}
+            kwargs = {"controls": c, "resolvedHistory": entry["resolvedHistory"],
+                "voiceMode": "unconditioned" if body.get("voiceMode") == "unconditioned" else "reference"}
         torch.cuda.reset_peak_memory_stats()
-        audio, sr, warnings = engine.generate_native(body["text"], body["voiceId"], entry["dir"], entry["meta"], body["language"], kwargs)
+        try:
+            audio, sr, warnings = engine.generate_native(body["text"], body.get("voiceId"), entry["dir"], entry["meta"], body["language"], kwargs)
+        except Exception as error:
+            proof = getattr(error, "native_failure_artifact", None)
+            if proof is not None:
+                if not isinstance(proof, bytes) or len(proof) > 65536:
+                    raise RuntimeError("Bounded native failure artifact required") from error
+                (path / "failed-drama3-generation.json").write_bytes(proof)
+            raise
         if cancel.is_set():
             raise InterruptedError("Cancellation joined native PolyTTS synthesis")
         target = path / "audio.wav"
@@ -1680,8 +1700,10 @@ def _install_owned_jobs():
                 "cpuExpertLayers": int(os.environ.get("POLYTTS_DRAMA3_CPU_EXPERT_LAYERS", "8")),
                 "contextLength": int(os.environ.get("POLYTTS_DRAMA3_CONTEXT_LENGTH", "2048"))} if body["engine"] == "drama3" else {"implementation": "IndexTTS2.5 native PyTorch"}),
             "historySources": entry["historyProofs"], "artifacts": retained_artifacts, "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
-            "referenceSha256": body["referenceSha256"],
-            "referenceTextSha256": hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest(), "warnings": warnings,
+            "voiceMode": "unconditioned" if body.get("voiceMode") == "unconditioned" else "reference",
+            **({"referenceSha256": body["referenceSha256"],
+                "referenceTextSha256": hashlib.sha256(entry["meta"].get("ref_text", "").encode()).hexdigest()}
+                if body.get("voiceMode") != "unconditioned" else {}), "warnings": warnings,
             "torchPeakAllocatedBytes": torch.cuda.max_memory_allocated(),
             "torchPeakReservedBytes": torch.cuda.max_memory_reserved()}
 
@@ -1699,6 +1721,7 @@ def _install_owned_jobs():
                 "implementation": "audio.cpp community native GGML port", "implementation_revision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"],
                 "sample_rate": 44100, "channels": 1, "languages": ["en"], "inline_event_tags": True,
                 "owned_previous_take_history": True, "native_take_artifact": True, "exact_seconds": False,
+                "unconditioned": {"supported": True, "installed_owner_ids": config.get("unconditionedOwnerIds", [])},
                 "interruptible_inference": False, "license": "Fish Audio Community License1.0"}
         return {"engines": engines, "voices": [{"id": key, "sha256": value["sha256"],
                 "origin": value["origin"]} for key, value in config["voices"].items()]}

@@ -1,5 +1,24 @@
 # Fish Audio Drama3 native PolyTTS engine
 
+Source addition2026-10-20 (not an activation claim): an explicit managed request
+`voiceMode: "unconditioned"` omits both `voiceId` and `referenceSha256`. It is
+Drama-only, requires exact owner membership in installed `unconditionedOwnerIds`,
+and uses the real native `tts` session without setting reference audio or text.
+No silence, placeholder voice ID or invented reference hash is supplied. The
+same native TTS task also accepts the existing explicit registered reference.
+Installed source identity must pin `nativeSessionTask: "tts"`; receipts bind
+voiceMode and history cannot cross conditioning modes. Reference-free output
+does not promise stable timbre between independent requests; retained native
+history is the existing continuation mechanism, separately qualified.
+
+Failure diagnostics now distinguish native frame-limit exhaustion from malformed
+metadata and retain actual generation proof/digest in `receipt.nativeFailure`.
+The original bounded proof file is retained owner-local as
+`failed-drama3-generation.json`; no failed partial audio is published. This
+changes no EOS decision, sampling or completion admission. Native upstream
+documents that some emotion/nonverbal prompts prolong reactions or hit the cap;
+reference-free support must be measured and does not itself guarantee a remedy.
+
 Implementation worktree only; runtime/model qualification is separate. This is exact Drama3, not Fish S2. Official source541566932abbaebcb0a40e562a1f846738383f38 identifies35B-total/3B-active parameters. The official Python FP8 runtime requires48GB; this adapter instead targets the community audio.cpp native GGML portccdbe76929e8a77428db6ec3bbbaadeb35acae38 through its actual C ABI0.2.
 
 Selected checkpoint: Jmica/Drama-3-GGUF@17a5b40c5dc2c2be986f5371a7e650108b828e29, drama-3-backbone-8bit-experts-Q3_K_S.gguf,20325196992bytes, SHAb946a8c9806deba559590b98e37ffc9e0957109263e111513734fa93284db16b. Expert banks useQ3_K, other backbone matricesQ8_0, audio tower/codecFP16. Selection is a concrete24GB experiment with8CPU expert layers/2048context; actual memory/latency/quality must be measured. Upstream's24GB guidance was tested on a96GB card, not physical3090 hardware.

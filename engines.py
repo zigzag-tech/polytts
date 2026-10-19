@@ -171,6 +171,13 @@ class IndexTts25Engine(Engine):
         return audio.astype(np.float32) / 32768.0, sr
 
 
+class NativeSpeechCompletionError(RuntimeError):
+    def __init__(self, reason, native_failure, native_failure_artifact):
+        super().__init__(reason)
+        self.native_failure = native_failure
+        self.native_failure_artifact = native_failure_artifact
+
+
 class Drama3Engine(Engine):
     """Exact Fish Audio Drama3 via the upstream audio.cpp community GGML port."""
     name = "drama3"
@@ -204,7 +211,7 @@ class Drama3Engine(Engine):
         context = int(os.environ.get("POLYTTS_DRAMA3_CONTEXT_LENGTH", "2048"))
         if not 0 <= cpu_layers <= 40 or context not in (2048, 4096, 8192):
             raise RuntimeError("Closed Drama3 session profile refused")
-        self._session = NativeAudioSession(library, model, family="fish_drama3",
+        self._session = NativeAudioSession(library, model, family="fish_drama3", task="tts",
             session_options={"fish_drama3.cpu_expert_layers": cpu_layers,
                              "fish_drama3.context_length": context}, threads=4)
         torch.cuda.synchronize()
@@ -246,16 +253,25 @@ class Drama3Engine(Engine):
     def generate_native(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
         import json
         import torch
-        envelope = gen_kwargs if set(gen_kwargs) == {"controls", "resolvedHistory"} else None
+        envelope = gen_kwargs if set(gen_kwargs) == {"controls", "resolvedHistory", "voiceMode"} else None
         controls = self.validate_controls(envelope["controls"] if envelope else gen_kwargs.get("drama_controls", gen_kwargs))
         history = envelope["resolvedHistory"] if envelope else []
         if len(history) != len(controls.get("history", [])):
             raise ValueError("History requires the actual owned managed-job resolver")
-        reference, rate = sf.read(voice_dir / "voice.wav", dtype="float32")
+        voice_mode = envelope["voiceMode"] if envelope else "reference"
+        if voice_mode not in {"reference", "unconditioned"}:
+            raise ValueError("Explicit native voice conditioning mode required")
+        if voice_mode == "unconditioned":
+            if voice_id is not None or voice_dir is not None or meta:
+                raise ValueError("Unconditioned mode refuses reference identity/data")
+            reference, rate = None, None
+        else:
+            reference, rate = sf.read(voice_dir / "voice.wav", dtype="float32")
         options = {"temperature": controls["temperature"], "top_p": controls["topP"],
             "top_k": controls["topK"], "max_tokens": controls["maxTokens"], "seed": controls["seed"],
-            "text_chunk_size": controls["textChunkSize"], "text_chunk_mode": "tag_aware",
-            "reference_text": meta["ref_text"]}
+            "text_chunk_size": controls["textChunkSize"], "text_chunk_mode": "tag_aware"}
+        if voice_mode == "reference":
+            options["reference_text"] = meta["ref_text"]
         if history:
             options["previous_takes"] = json.dumps(history, separators=(",", ":"), ensure_ascii=False)
         audio, rate, artifacts = self._session.run(text, language or "en", reference, rate, options)
@@ -265,7 +281,14 @@ class Drama3Engine(Engine):
             raise RuntimeError("Authoritative native generation metadata missing")
         proof = json.loads(proofs[0]["payload"])
         if set(proof) != {"frames", "reached_limit", "wall_ms"} or proof["reached_limit"] is not False:
-            raise RuntimeError("Native Drama3 frame-limit or malformed completion refused")
+            reason = "native_frame_limit" if proof.get("reached_limit") is True else "malformed_native_completion"
+            raise NativeSpeechCompletionError("Native Drama3 " + reason + "; partial audio refused", {
+                "schema": "drama3_failed_completion_v1", "reason": reason, "generation": proof,
+                "generationArtifactSha256": hashlib.sha256(proofs[0]["payload"]).hexdigest(),
+                "generationArtifactBytes": len(proofs[0]["payload"]), "voiceMode": voice_mode,
+                "requestedMaxFramesPerChunk": controls["maxTokens"], "outputAudioFrames": len(audio),
+                "sampleRate": rate, "textSha256": hashlib.sha256(text.encode()).hexdigest(),
+                "partialAudioPublished": False}, proofs[0]["payload"])
         takes = [item for item in artifacts if item["id"] == "drama3_take" and item["kind"] == 3]
         if len(takes) != 1:
             raise RuntimeError("Exact native continuation output missing")
