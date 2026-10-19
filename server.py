@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16
+from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, IndexTts25Engine, pcm16
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -92,6 +92,8 @@ MAX_SENTENCES_PER_GEN = {
 }
 
 app = FastAPI(title="PolyTTS Server")
+from livestack_node import counting
+_managed_busy = counting()
 
 # Filled at startup
 model = None
@@ -214,7 +216,7 @@ if _MANAGER_PATH:
     # that disqualified the heavier dots.tts-soar checkpoint beside polyasr.
     # See openspec/changes/add-dots-tts-engine.
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
-                   "cosyvoice": 3_000_000_000, "dots": 8_000_000_000}
+                   "cosyvoice": 3_000_000_000, "dots": 8_000_000_000, "indextts25": 16 * 1024**3}
 
     _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
 
@@ -237,11 +239,21 @@ if _MANAGER_PATH:
         # an idle engine outranks live demand. Unset, behaviour is unchanged.
         return ManagedUnit(name, loader, freer,
                            footprint=_FOOTPRINTS.get(name, 0),
+                           attributes=({"class": "tts", "task": "text_to_speech",
+                              "model": "IndexTeam/IndexTTS-2.5", "sample_rate": 22050,
+                              "revision": os.environ.get("POLYTTS_INDEXTTS25_REVISION"),
+                              "languages": ["en", "zh", "ja", "es", "ar"],
+                              "max_concurrent": 1} if name == "indextts25" else {}),
                            residency_policy=(getattr(ResidencyPolicy, _DEFAULT_RESIDENCY)
                                              if pin else ResidencyPolicy.UNPINNED))
 
     _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
-                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()}
+                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine(), "indextts25": IndexTts25Engine()}
+    if os.environ.get("POLYTTS_ENABLED_ENGINES"):
+        enabled = set(os.environ["POLYTTS_ENABLED_ENGINES"].split(","))
+        if not enabled <= _ENGINES.keys() or DEFAULT_ENGINE not in enabled:
+            raise RuntimeError("Explicit enabled engines/default mismatch")
+        _ENGINES = {name: engine for name, engine in _ENGINES.items() if name in enabled}
     _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
 
     def _gpu_call(fn):
@@ -262,10 +274,11 @@ if _MANAGER_PATH:
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts", units=_UNITS,
                                     idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                     gpu_call=_gpu_call, port=PORT,
-                                    in_flight=lambda: _inflight,
+                                    in_flight=lambda: _inflight + _managed_busy(),
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
-                                    preload=lambda: _warm_manager_path())
+                                    preload=(None if os.environ.get("POLYTTS_NO_PRELOAD") == "1" else lambda: _warm_manager_path()),
+                                    device_id=os.environ.get("POLYTTS_DEVICE_ID"))
     except ImportError:
         from livestack_node import ModelManager
         manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -317,7 +330,7 @@ elif RUNTIME == "mlx":
         manager, residence = attach(app, host_id=HOST_ID, kind="polytts",
                                     units=_MLX_UNITS, idle_seconds=IDLE_EVICT_SECONDS,
                                     coload=True, gpu_call=_gpu_call, port=PORT,
-                                    in_flight=lambda: _inflight,
+                                    in_flight=lambda: _inflight + _managed_busy(),
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
                                     # On the GPU executor, like every other MLX call: MLX
@@ -1131,6 +1144,13 @@ class TTSRequest(BaseModel):
     # CosyVoice instruct (emotion/style) — e.g. "请用温暖的语气" or "用沉稳严肃的语调".
     # Only the cosyvoice engine honors this; ignored by qwen/voxcpm.
     instruct: str | None = None
+    # IndexTTS 2.5 native acoustic controls; duration is a factor, not seconds.
+    duration_factor: float | None = None
+    emotion_alpha: float | None = None
+    emotion_vector: list[float] | None = None
+    interval_silence_ms: int | None = None
+    max_text_tokens_per_segment: int | None = None
+    seed: int | None = None
 
 
 def _generation_kwargs(req: TTSRequest) -> dict:
@@ -1146,7 +1166,8 @@ def _generation_kwargs(req: TTSRequest) -> dict:
         "cfg_value",
         "inference_timesteps",
         "denoise",
-        "instruct",
+        "instruct", "duration_factor", "emotion_alpha", "emotion_vector",
+        "interval_silence_ms", "max_text_tokens_per_segment", "seed",
     )
     return {key: getattr(req, key) for key in fields if getattr(req, key) is not None}
 
@@ -1534,6 +1555,80 @@ def _refuse_if_port_taken() -> None:
         )
     finally:
         probe.close()
+
+
+def _install_owned_jobs():
+    configuration = os.environ.get("POLYTTS_MANAGED_JOBS_CONFIG")
+    if not configuration:
+        return
+    if not _MANAGER_PATH or residence is None:
+        raise RuntimeError("Managed speech requires the actual Harmony coordinator")
+    from livestack_node.tts.jobs import install_managed_tts_jobs
+    from livestack_node.tts.protocol import validate_request
+    config = json.loads(Path(configuration).read_text())
+    import torch
+    actual_uuid = str(torch.cuda.get_device_properties(0).uuid).removeprefix("GPU-")
+    if actual_uuid != config["cudaVisibleDevice"].removeprefix("GPU-"):
+        raise RuntimeError("Actual physical CUDA device differs from installed configuration")
+    if hashlib.sha256(Path(config["modelManifestPath"]).read_bytes()).hexdigest() != config["modelManifestSha256"]:
+        raise RuntimeError("Pinned model inventory changed")
+
+    def validate(body):
+        if not isinstance(body, dict) or body.get("engine") != "indextts25" or body["engine"] not in _ENGINES:
+            raise ValueError("Explicit installed PolyTTS engine required")
+        validate_request({key: value for key, value in body.items() if key != "engine"})
+        return body
+
+    def prepare(body):
+        name, entry = _resolve_engine(body["engine"], body["voiceId"])
+        allowed = config["voices"].get(body["voiceId"])
+        if not entry or entry["engine"] != name or not allowed or allowed["sha256"] != body["referenceSha256"]:
+            raise ValueError("Installed engine/reference identity refused")
+        reference = entry["dir"] / "voice.wav"
+        if hashlib.sha256(reference.read_bytes()).hexdigest() != body["referenceSha256"]:
+            raise ValueError("Registered reference bytes changed")
+        return entry
+
+    def generate(engine, body, path, cancel):
+        entry = prepare(body)
+        if cancel.is_set():
+            raise InterruptedError("Cancelled before native PolyTTS synthesis")
+        c = body["controls"]
+        kwargs = {"duration_factor": c["durationFactor"], "emotion_alpha": c["emotionAlpha"],
+            "interval_silence_ms": c["intervalSilenceMs"], "max_text_tokens_per_segment": c["maxTextTokensPerSegment"],
+            "seed": c["seed"]}
+        if "emotionVector" in c:
+            kwargs["emotion_vector"] = c["emotionVector"]
+        torch.cuda.reset_peak_memory_stats()
+        audio, sr, warnings = engine.generate_native(body["text"], body["voiceId"], entry["dir"], entry["meta"], body["language"], kwargs)
+        if cancel.is_set():
+            raise InterruptedError("Cancellation joined native PolyTTS synthesis")
+        target = path / "audio.wav"
+        sf.write(target, audio, sr, subtype="PCM_16")
+        payload = target.read_bytes()
+        return {"audio": {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload),
+            "sampleRate": sr, "channels": 1, "frames": len(audio), "durationSeconds": len(audio) / sr},
+            "model": {"engine": body["engine"], "model": engine.model_name,
+                "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"]},
+            "controls": c, "textSha256": hashlib.sha256(body["text"].encode()).hexdigest(),
+            "referenceSha256": body["referenceSha256"], "warnings": warnings,
+            "torchPeakAllocatedBytes": torch.cuda.max_memory_allocated(),
+            "torchPeakReservedBytes": torch.cuda.max_memory_reserved()}
+
+    def capabilities():
+        return {"engines": {"indextts25": {"model": "IndexTeam/IndexTTS-2.5",
+            "revision": os.environ["POLYTTS_INDEXTTS25_REVISION"], "sample_rate": 22050,
+            "channels": 1, "emotion_vector": True, "emotion_text": False,
+            "duration_factor": {"min": .5, "max": 2, "exact_seconds": False},
+            "interruptible_inference": False}}, "voices": [{"id": key, "sha256": value["sha256"],
+                "origin": value["origin"]} for key, value in config["voices"].items()]}
+
+    install_managed_tts_jobs(app, config, manager=manager, coordinator=residence,
+        gpu=_gpu_call, busy=_managed_busy, validate=validate, prepare=prepare,
+        generate=generate, capabilities=capabilities, synchronize=torch.cuda.synchronize)
+
+
+_install_owned_jobs()
 
 
 if __name__ == "__main__":

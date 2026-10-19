@@ -90,6 +90,87 @@ class Engine:
         yield audio
 
 
+class IndexTts25Engine(Engine):
+    """Pinned IndexTTS 2.5 native backend; model residency belongs to PolyTTS."""
+    name = "indextts25"
+    sample_rate = 22050
+
+    def __init__(self):
+        self._model = None
+        self.model_name = "IndexTeam/IndexTTS-2.5"
+
+    @property
+    def loaded(self):
+        return self._model is not None
+
+    def load(self):
+        import sys
+        import torch
+        source = Path(os.environ["POLYTTS_INDEXTTS25_SOURCE"]).resolve(strict=True)
+        models = Path(os.environ["POLYTTS_INDEXTTS25_MODELS"]).resolve(strict=True)
+        if not torch.cuda.is_available():
+            raise RuntimeError("IndexTTS 2.5 requires the configured CUDA device")
+        budget = int(os.environ.get("POLYTTS_INDEXTTS25_BUDGET_BYTES", str(16 * 1024**3)))
+        torch.cuda.set_per_process_memory_fraction(budget / torch.cuda.get_device_properties(0).total_memory, 0)
+        sys.path.insert(0, str(source))
+        from indextts.infer_v2_5 import IndexTTS2
+        self._model = IndexTTS2(cfg_path=str(models / "config.yaml"), model_dir=str(models),
+            device="cuda:0", use_bf16=True, use_cuda_kernel=False, use_deepspeed=False,
+            use_accel=False, use_torch_compile=False, use_qwen_emo=False)
+        torch.cuda.synchronize()
+
+    def unload(self):
+        model, self._model = self._model, None
+        del model
+        gc.collect()
+        _free_cuda()
+
+    def generate_native(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        import random
+        import warnings
+        import torch
+        from livestack_node.tts.protocol import validate_request
+        controls = {
+            "durationFactor": gen_kwargs.get("duration_factor", 1.0),
+            "emotionAlpha": gen_kwargs.get("emotion_alpha", 1.0),
+            "intervalSilenceMs": gen_kwargs.get("interval_silence_ms", 200),
+            "maxTextTokensPerSegment": gen_kwargs.get("max_text_tokens_per_segment", 120),
+            "seed": gen_kwargs.get("seed", 0),
+        }
+        if "emotion_vector" in gen_kwargs:
+            controls["emotionVector"] = gen_kwargs["emotion_vector"]
+        validate_request(dict(jobId="validation", ownerId="polytts", text=text,
+            language=language or "en", voiceId=voice_id, referenceSha256="validation", controls=controls))
+        random.seed(controls["seed"])
+        np.random.seed(controls["seed"])
+        torch.manual_seed(controls["seed"])
+        torch.cuda.manual_seed_all(controls["seed"])
+        with warnings.catch_warnings(record=True) as observed:
+            result = self._model.infer(spk_audio_prompt=str(voice_dir / "voice.wav"), text=text,
+                output_path=None, lang=language or "en", duration_factor=controls["durationFactor"],
+                emo_vector=controls.get("emotionVector"), emo_alpha=controls["emotionAlpha"],
+                interval_silence=controls["intervalSilenceMs"],
+                max_text_tokens_per_segment=controls["maxTextTokensPerSegment"],
+                use_random=False, use_emo_text=False, stream_return=False, text_normalization=True)
+        torch.cuda.synchronize()
+        messages = [str(item.message) for item in observed]
+        if any("max_mel_tokens" in item or "generation stopped" in item for item in messages):
+            raise RuntimeError("Truncated IndexTTS 2.5 output refused")
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("IndexTTS 2.5 returned no native audio")
+        sr, audio = result
+        audio = np.asarray(audio)
+        if audio.ndim == 2 and audio.shape[1] == 1:
+            audio = audio[:, 0]
+        if sr != self.sample_rate or audio.ndim != 1 or audio.dtype != np.int16 or not len(audio):
+            raise RuntimeError("IndexTTS 2.5 native mono PCM16 clock refused")
+        return audio, sr, messages
+
+    def generate(self, text, voice_id, voice_dir, meta, language, gen_kwargs):
+        audio, sr, _ = self.generate_native(text, voice_id, voice_dir, meta, language, gen_kwargs)
+        return audio.astype(np.float32) / 32768.0, sr
+
+
 # ---------------------------------------------------------------------------
 # Qwen3-TTS engine (pytorch)
 # ---------------------------------------------------------------------------
