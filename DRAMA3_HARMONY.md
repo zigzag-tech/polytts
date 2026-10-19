@@ -19,6 +19,14 @@ changes no EOS decision, sampling or completion admission. Native upstream
 documents that some emotion/nonverbal prompts prolong reactions or hit the cap;
 reference-free support must be measured and does not itself guarantee a remedy.
 
+An isolated candidate can register a distinct `POLYTTS_DRAMA3_UNIT_KIND`, bound
+through installed `engineUnitKinds` and source identity, while the public engine
+remains `drama3`. Actual acquisition/admission/run all use that exact mapped
+unit. This lets the real Harmony planner evict the old idle unit before warming
+the candidate, without restarting the old service or pretending its model is
+already resident in the new process. Use a fresh no-preload namespace and keep
+the old reference route/receipts intact; no global default changes are implied.
+
 Implementation worktree only; runtime/model qualification is separate. This is exact Drama3, not Fish S2. Official source541566932abbaebcb0a40e562a1f846738383f38 identifies35B-total/3B-active parameters. The official Python FP8 runtime requires48GB; this adapter instead targets the community audio.cpp native GGML portccdbe76929e8a77428db6ec3bbbaadeb35acae38 through its actual C ABI0.2.
 
 Selected checkpoint: Jmica/Drama-3-GGUF@17a5b40c5dc2c2be986f5371a7e650108b828e29, drama-3-backbone-8bit-experts-Q3_K_S.gguf,20325196992bytes, SHAb946a8c9806deba559590b98e37ffc9e0957109263e111513734fa93284db16b. Expert banks useQ3_K, other backbone matricesQ8_0, audio tower/codecFP16. Selection is a concrete24GB experiment with8CPU expert layers/2048context; actual memory/latency/quality must be measured. Upstream's24GB guidance was tested on a96GB card, not physical3090 hardware.

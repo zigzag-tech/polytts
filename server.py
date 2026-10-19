@@ -236,6 +236,9 @@ if _MANAGER_PATH:
 
     _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
 
+    def _unit_name(name):
+        return os.environ.get("POLYTTS_DRAMA3_UNIT_KIND", "drama3") if name == "drama3" else name
+
     def _engine_unit(name, engine, pin):
         def loader():
             engine.load()
@@ -253,7 +256,7 @@ if _MANAGER_PATH:
         # engine can be the reason a model that IS being asked for has nowhere
         # to go — SOFT_PIN only yields to something strictly more important, so
         # an idle engine outranks live demand. Unset, behaviour is unchanged.
-        return ManagedUnit(name, loader, freer,
+        return ManagedUnit(_unit_name(name), loader, freer,
                            footprint=_FOOTPRINTS.get(name, 0),
                            attributes=({"class": "tts", "task": "text_to_speech",
                               "model": "IndexTeam/IndexTTS-2.5", "sample_rate": 22050,
@@ -273,7 +276,7 @@ if _MANAGER_PATH:
         if not enabled <= _ENGINES.keys() or DEFAULT_ENGINE not in enabled:
             raise RuntimeError("Explicit enabled engines/default mismatch")
         _ENGINES = {name: engine for name, engine in _ENGINES.items() if name in enabled}
-    _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
+    _UNITS = {_unit_name(n): _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
 
     def _gpu_call(fn):
         """Run a thunk on the single GPU executor (warm/evict from /livestack)."""
@@ -1595,6 +1598,9 @@ def _install_owned_jobs():
     if "drama3" in _ENGINES:
         if config["sourceIdentity"].get("nativeSessionTask") != "tts":
             raise RuntimeError("Installed Drama3 native TTS task identity differs")
+        actual_kinds = {"drama3": _unit_name("drama3")}
+        if config.get("engineUnitKinds") != actual_kinds or config["sourceIdentity"].get("engineUnitKinds") != actual_kinds:
+            raise RuntimeError("Installed Drama3 engine/unit identity differs")
         owners = config.get("unconditionedOwnerIds", [])
         if not isinstance(owners, list) or any(not isinstance(owner, str) or not owner or not any(owner.startswith(prefix) for prefix in config["allowedOwnerPrefixes"]) for owner in owners):
             raise RuntimeError("Explicit installed unconditioned owner scopes required")
@@ -1717,6 +1723,7 @@ def _install_owned_jobs():
                 "interruptible_inference": False}
         if "drama3" in _ENGINES:
             engines["drama3"] = {"model": "fishaudio/drama-3", "revision": os.environ["POLYTTS_DRAMA3_MODEL_REVISION"],
+                "harmony_unit_kind": _unit_name("drama3"),
                 "model_sha256": os.environ["POLYTTS_DRAMA3_MODEL_SHA256"], "quantization": "Q3_K experts/Q8_0 backbone/FP16 audio",
                 "implementation": "audio.cpp community native GGML port", "implementation_revision": os.environ["POLYTTS_DRAMA3_SOURCE_REVISION"],
                 "sample_rate": 44100, "channels": 1, "languages": ["en"], "inline_event_tags": True,
