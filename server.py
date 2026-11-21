@@ -43,6 +43,7 @@ RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 # not flipping this flag. See docs/ — deferred.
 _MANAGER_PATH = RUNTIME != "mlx"
 IDLE_EVICT_SECONDS = int(os.environ.get("POLYTTS_IDLE_EVICT_SECONDS", "120"))
+WARM_ON_START = os.environ.get("POLYTTS_WARM_ON_START", "0").lower() in {"1", "true", "yes"}
 # Whether two engines may hold the card at once. Off by default: the smallest
 # host this runs on cannot afford it. See the residency note below.
 COLOAD = os.environ.get("POLYTTS_COLOAD", "").strip().lower() in ("1", "true", "yes")
@@ -216,7 +217,7 @@ if _MANAGER_PATH:
     _FOOTPRINTS = {"qwen": 8_700_000_000, "voxcpm": 5_000_000_000,
                    "cosyvoice": 3_000_000_000, "dots": 8_000_000_000}
 
-    _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "SOFT_PIN").strip().upper()
+    _DEFAULT_RESIDENCY = os.environ.get("POLYTTS_DEFAULT_RESIDENCY", "UNPINNED").strip().upper()
 
     def _engine_unit(name, engine, pin):
         def loader():
@@ -265,19 +266,17 @@ if _MANAGER_PATH:
                                     in_flight=lambda: _inflight,
                                     inventory=_inventory,
                                     # After the bind, never before: see startup().
-                                    preload=lambda: _warm_manager_path())
-    except ImportError:
-        from livestack_node import ModelManager
-        manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
+                                    preload=(lambda: _warm_manager_path()) if WARM_ON_START else None)
+    except ImportError as exc:
+        raise RuntimeError("PolyTTS requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 # MLX runtime: the native-MLX models (qwen `model`, voxcpm `_voxcpm_mlx`) are held
 # as globals and served by a separate native path (NOT engines.py, the PyTorch
 # backend). Wrap their load/free in ManagedUnits so polytts becomes a livestack
 # node: a host-broker can SEE its Metal footprint and EVICT the heavy voxcpm
 # engine when idle to relieve Metal pressure (e.g. an ASR align-chunk spike).
-# qwen is HARD_PIN (its `model` global is read pervasively in the serving path, so
-# it is never evicted); voxcpm is SOFT_PIN + reached only through the
-# _load_voxcpm_mlx() accessor above, so it reloads safely on next use.
+# Both engines are unpinned. Synthesis reacquires the owning unit on the GPU
+# executor; voice prompts are built lazily and dropped with the Qwen model.
 elif RUNTIME == "mlx":
     from livestack_node import ManagedUnit, ResidencyPolicy
 
@@ -288,6 +287,7 @@ elif RUNTIME == "mlx":
     def _qwen_unit_free():
         global model
         model = None
+        _mlx_prompt_cache.clear()
         import mlx.core as mx
         mx.clear_cache()
         gc.collect()
@@ -302,10 +302,10 @@ elif RUNTIME == "mlx":
     _MLX_UNITS = {
         "qwen": ManagedUnit("qwen", _qwen_unit_load, _qwen_unit_free,
                             footprint=3_000_000_000,
-                            residency_policy=ResidencyPolicy.HARD_PIN),
+                            residency_policy=ResidencyPolicy.UNPINNED),
         "voxcpm": ManagedUnit("voxcpm", _voxcpm_unit_load, _voxcpm_unit_free,
                               footprint=8_000_000_000,
-                              residency_policy=ResidencyPolicy.SOFT_PIN),
+                              residency_policy=ResidencyPolicy.UNPINNED),
     }
 
     def _gpu_call(fn):
@@ -325,10 +325,9 @@ elif RUNTIME == "mlx":
                                     # attach thread abort the first synthesis on the
                                     # executor ("There is no Stream(cpu, 1) in current
                                     # thread" -> SIGABRT, launchd restart loop).
-                                    preload=lambda: _gpu_call(_warm_mlx))
-    except ImportError:
-        manager = None
-        residence = None
+                                    preload=(lambda: _gpu_call(_warm_mlx)) if WARM_ON_START else None)
+    except ImportError as exc:
+        raise RuntimeError("PolyTTS requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 # ---------------------------------------------------------------------------
 # Admission control — bound concurrent in-flight streaming syntheses so a burst
@@ -658,6 +657,9 @@ def _register_voice_mlx(voice_id: str, wav_path: str, ref_text: str):
 
     Must be called from the GPU executor thread.
     """
+    voice_registry[voice_id] = {"engine": "qwen", "dir": VOICES_DIR / voice_id,
+                                "meta": {"ref_text": ref_text}}
+    _ensure_qwen_mlx()
     prompt = _precompute_voice_mlx(wav_path, ref_text)
     _save_voice_cache_mlx(VOICES_DIR / voice_id, prompt)
     voice_meta[voice_id] = {"ref_text": ref_text}
@@ -665,6 +667,13 @@ def _register_voice_mlx(voice_id: str, wav_path: str, ref_text: str):
     _mlx_prompt_cache[voice_id] = prompt
     _mlx_prompt_cache.move_to_end(voice_id)
     _trim_voice_caches()
+
+
+def _ensure_qwen_mlx():
+    """Acquire Qwen on demand on the GPU executor, including after eviction."""
+    if manager is None:
+        raise RuntimeError("MLX synthesis requires Livestack Harmony")
+    return manager.ensure("qwen")
 
 
 @contextmanager
@@ -677,6 +686,18 @@ def _mlx_voice_context(text: str, voice_id: str | None, extra_kwargs: dict | Non
     because the GPU executor is single-threaded — only one generation runs at
     a time.  Must be entered on the GPU executor thread.
     """
+    _ensure_qwen_mlx()
+    if voice_id and voice_id not in _mlx_prompt_cache:
+        entry = voice_registry.get(voice_id)
+        if entry is None:
+            raise ValueError(f"Unknown voice_id: {voice_id}")
+        ref_text = entry["meta"].get("ref_text", "")
+        prompt = _load_voice_cache_mlx(entry["dir"], ref_text)
+        if prompt is None:
+            prompt = _precompute_voice_mlx(str(entry["dir"] / "voice.wav"), ref_text)
+            _save_voice_cache_mlx(entry["dir"], prompt)
+        _mlx_prompt_cache[voice_id] = prompt
+        _trim_voice_caches()
     kwargs: dict = {"text": text}
     if extra_kwargs:
         kwargs.update(extra_kwargs)
@@ -955,7 +976,15 @@ async def startup():
     # fleet view models and the ranker filters on, so an unwarmed node is not
     # chosen rather than chosen and slow.
     if RUNTIME == "mlx":
-        if manager is None:
+        _scan_voice_registry()
+        for voice_id, entry in voice_registry.items():
+            if entry["engine"] == "voxcpm":
+                _mlx_voxcpm_voices[voice_id] = {
+                    "dir": entry["dir"], "ref_text": entry["meta"].get("ref_text", ""),
+                    "meta": entry["meta"]}
+            else:
+                voice_meta[voice_id] = {"ref_text": entry["meta"].get("ref_text", "")}
+        if WARM_ON_START and manager is None:
             # No livestack: nobody will warm this for us, and there is no
             # arbitration to deadlock against either. Own thread, so the bind
             # still happens now.
@@ -966,7 +995,7 @@ async def startup():
         return
 
     _scan_voice_registry()
-    if manager is not None and residence is None:
+    if WARM_ON_START and manager is not None and residence is None:
         # Same case on the manager path: no livestack attach, no preload hook.
         threading.Thread(target=_warm_manager_path, name="polytts-warm", daemon=True).start()
 
@@ -1204,7 +1233,7 @@ async def tts(req: TTSRequest):
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(content=cached, media_type="audio/wav")
-        if req.voice_id and req.voice_id not in _mlx_prompt_cache:
+        if req.voice_id and req.voice_id not in voice_registry:
             raise HTTPException(404, f"Unknown voice_id: {req.voice_id}")
         try:
             wav_bytes = await asyncio.wait_for(
@@ -1516,10 +1545,10 @@ def _refuse_if_port_taken() -> None:
     import socket
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Deliberately NOT SO_REUSEADDR: the question is "is somebody serving
-    # here", and the option exists to make that question answer no.
+    # Allow a clean restart through TIME_WAIT; a live listener still refuses.
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        probe.bind(("0.0.0.0", PORT))
+        probe.bind((os.environ.get("LIVESTACK_LISTEN_HOST", "0.0.0.0"), PORT))
     except OSError as exc:
         import errno as _errno
 
@@ -1538,4 +1567,4 @@ def _refuse_if_port_taken() -> None:
 
 if __name__ == "__main__":
     _refuse_if_port_taken()
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=os.environ.get("LIVESTACK_LISTEN_HOST", "0.0.0.0"), port=PORT)
