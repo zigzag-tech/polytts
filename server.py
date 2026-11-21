@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16
+from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16, present_engines
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -48,6 +48,8 @@ WARM_ON_START = os.environ.get("POLYTTS_WARM_ON_START", "0").lower() in {"1", "t
 # host this runs on cannot afford it. See the residency note below.
 COLOAD = os.environ.get("POLYTTS_COLOAD", "").strip().lower() in ("1", "true", "yes")
 DEFAULT_ENGINE = os.environ.get("POLYTTS_DEFAULT_ENGINE", "qwen")
+# Engines this host cannot load ({name: reason}); filled at manager setup.
+_MISSING_ENGINES: dict = {}
 
 # Engines whose non-x-vector cloning path consumes the reference TRANSCRIPT,
 # so a blank ref_text cannot serve it. cosyvoice is absent deliberately: its
@@ -241,8 +243,14 @@ if _MANAGER_PATH:
                            residency_policy=(getattr(ResidencyPolicy, _DEFAULT_RESIDENCY)
                                              if pin else ResidencyPolicy.UNPINNED))
 
-    _ENGINES = {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
-                "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()}
+    # An engine whose model files are absent is not a unit: advertising it let
+    # the host broker evict a live model to warm a load certain to fail
+    # (zz-whitby 2026-11-21, qwen with no models/ dir).
+    _ENGINES, _MISSING_ENGINES = present_engines(
+        {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
+         "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()})
+    for _name, _why in _MISSING_ENGINES.items():
+        print(f"[polytts] engine {_name} not offered: {_why}", flush=True)
     _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
 
     def _gpu_call(fn):
@@ -923,7 +931,10 @@ def _resolve_engine(req_engine, voice_id):
     entry = voice_registry.get(voice_id)
     if entry is None:
         return None, None
-    return (req_engine or entry["engine"]), entry
+    name = req_engine or entry["engine"]
+    if name in _MISSING_ENGINES:
+        raise HTTPException(503, f"engine {name} is not available here: {_MISSING_ENGINES[name]}")
+    return name, entry
 
 
 # ---------------------------------------------------------------------------

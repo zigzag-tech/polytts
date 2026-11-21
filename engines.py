@@ -77,6 +77,13 @@ class Engine:
     def loaded(self) -> bool:
         raise NotImplementedError
 
+    def missing(self):
+        """Why this engine cannot load on this host (a reason string), or None.
+        Checked once at startup: an engine that cannot load is not offered as a
+        unit, so a broker never evicts something else to warm a load that is
+        certain to fail. Only checks what is cheap and certain (local files)."""
+        return None
+
     def prepare_voice(self, voice_id: str, voice_dir: Path, meta: dict):
         """Ensure any per-voice GPU artifacts exist (model is resident)."""
 
@@ -88,6 +95,12 @@ class Engine:
         """Yield audio_float32_1d chunks. Default: one chunk via generate()."""
         audio, _sr = self.generate(text, voice_id, voice_dir, meta, language, gen_kwargs)
         yield audio
+
+
+def present_engines(engines: dict) -> tuple[dict, dict]:
+    """Split {name: Engine} into (engines that can load, {name: why not})."""
+    missing = {n: why for n, e in engines.items() if (why := e.missing())}
+    return {n: e for n, e in engines.items() if n not in missing}, missing
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +125,14 @@ class QwenEngine(Engine):
     def loaded(self) -> bool:
         return self._model is not None
 
+    def _checkpoint(self) -> str:
+        key = os.environ.get("POLYTTS_MODEL", "1.7B")
+        return self.AVAILABLE_MODELS.get(key, self.AVAILABLE_MODELS["1.7B"])
+
+    def missing(self):
+        path = self._models_dir / self._checkpoint()
+        return None if path.exists() else f"Qwen model not found: {path}"
+
     def load(self):
         import torch
         from qwen_tts import Qwen3TTSModel
@@ -119,10 +140,7 @@ class QwenEngine(Engine):
         device = "cuda" if torch.cuda.is_available() else (
             "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
             else "cpu")
-        key = os.environ.get("POLYTTS_MODEL", "1.7B")
-        if key not in self.AVAILABLE_MODELS:
-            key = "1.7B"
-        self.model_name = self.AVAILABLE_MODELS[key]
+        self.model_name = self._checkpoint()
         path = self._models_dir / self.model_name
         if not path.exists():
             raise RuntimeError(f"Qwen model not found: {path}")

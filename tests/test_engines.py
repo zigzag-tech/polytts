@@ -3,7 +3,31 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from engines import VoxcpmEngine
+import tempfile
+from pathlib import Path
+
+from engines import QwenEngine, VoxcpmEngine, present_engines
+
+
+class EnginePresenceTest(unittest.TestCase):
+    """zz-whitby 2026-11-21: polytts advertised `qwen` with no models/ dir. The
+    host broker evicted flash_next to warm it, the warm answered 500 ("Qwen model
+    not found") and the card was held for 900 s. An engine that cannot load must
+    not be offered as a unit at all."""
+
+    def test_qwen_with_no_model_dir_is_not_advertised(self):
+        with tempfile.TemporaryDirectory() as d:
+            present, missing = present_engines(
+                {"qwen": QwenEngine(Path(d) / "models"), "voxcpm": VoxcpmEngine()})
+        self.assertEqual(list(present), ["voxcpm"])
+        self.assertIn("Qwen model not found", missing["qwen"])
+
+    def test_qwen_with_its_model_dir_is_advertised(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict("os.environ", {"POLYTTS_MODEL": "1.7B"}):
+            (Path(d) / "Qwen3-TTS-12Hz-1.7B-Base").mkdir()
+            present, missing = present_engines({"qwen": QwenEngine(Path(d))})
+        self.assertEqual(list(present), ["qwen"])
+        self.assertEqual(missing, {})
 
 
 class VoxcpmEngineTest(unittest.TestCase):
