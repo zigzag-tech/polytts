@@ -11,6 +11,10 @@
 # Consequence to know about: an MLX host without it starts, imports, and dies at
 # server.py — repeatedly. See the crash-budget note in README's auto-start
 # section before assuming a supervisor will bound that.
-mlx>=0.31.0
-mlx-audio>=0.4.4  # >=0.4.4 ships the voxcpm2 MLX model (model_type "voxcpm2")
-mlx-lm>=0.30.5
+mlx>=0.32.4
+# mlx-audio: voxcpm2 MLX model since 0.4.4. 0.6.7 was checked by reading the wheel
+# (not run): qwen3_tts/voxcpm2 generate() kwargs, GenerationResult, load_audio and
+# the extract_speaker_embedding / speech_tokenizer.encode hooks server.py patches
+# are unchanged from 0.4.7. mlx 0.32.x wheels need macOS >= 14.
+mlx-audio>=0.6.7
+mlx-lm>=0.32.2

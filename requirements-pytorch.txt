@@ -5,7 +5,11 @@
 # dots engine out while every other engine keeps working — which reads in the
 # logs as "dots is broken", not "the pin drifted". torchaudio's newest cu130
 # build is 2.11.0, so torch is pinned down to match rather than floating to the
-# newest (2.14). Bump BOTH together or not at all.
+# newest (2.15 as of 2026-11-21). Bump BOTH together or not at all.
+# torchaudio 2.11.1 (PyPI only) is a torch-agnostic py3-none build: it does NOT
+# load against torch 2.11.0 (libtorchaudio.so: undefined symbol
+# torch_exception_get_what_without_backtrace) and needs a newer torch, whose
+# minor then fails the dots.tts check. Checked 2026-11-21; stay on 2.11.0.
 torch==2.11.0
 torchaudio==2.11.0
 qwen-tts>=0.1.1

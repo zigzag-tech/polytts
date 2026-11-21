@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-soundfile
-pydantic
-python-multipart
-numpy
-requests
+fastapi>=0.165.0
+uvicorn>=0.54.0
+soundfile>=0.14.0
+pydantic>=2.14.4
+python-multipart>=0.0.34
+numpy>=2.5.5
+requests>=2.34.2

@@ -19,19 +19,19 @@ function Info($m) { Write-Host "==> $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "==> $m" -ForegroundColor Yellow }
 function Fail($m) { Write-Host "==> $m" -ForegroundColor Red; exit 1 }
 
-# ── Pre-flight: Python 3.10–3.12 (VoxCPM caps <3.13) ──────────────────────────
+# ── Pre-flight: Python 3.12 (numpy>=2.5 needs >=3.12; VoxCPM caps <3.13) ──────
 Info 'Checking prerequisites…'
 $pyCmd = $null
 foreach ($c in 'python', 'py') {
     if (Get-Command $c -ErrorAction SilentlyContinue) { $pyCmd = $c; break }
 }
-if (-not $pyCmd) { Fail 'Python not found. Install Python 3.10–3.12 first.' }
+if (-not $pyCmd) { Fail 'Python not found. Install Python 3.12 first.' }
 
 $pyVersion = & $pyCmd -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
 $parts = $pyVersion.Split('.')
 $maj = [int]$parts[0]; $min = [int]$parts[1]
-if ($maj -ne 3 -or $min -lt 10 -or $min -gt 12) {
-    Fail "Python 3.10–3.12 required (VoxCPM caps <3.13) — detected $pyVersion."
+if ($maj -ne 3 -or $min -lt 12 -or $min -gt 12) {
+    Fail "Python 3.12 required (numpy>=2.5 needs >=3.12; VoxCPM caps <3.13) — detected $pyVersion."
 }
 Write-Host "  Python: $pyVersion"
 
