@@ -162,6 +162,14 @@ most one model in VRAM at a time** — built for GPUs shared with other workload
   fields stay in `meta.json` for voices that have them, with no effect). The
   engine pins the RNG per voice instead, so repeat synthesis of the same text is
   byte-identical — which the `/tts/stream` disk PCM cache assumes.
+- **Only engines whose model files are on this host are offered.** At startup
+  each engine's `missing()` checks its model offline (qwen: `models/<checkpoint>`;
+  voxcpm/dots: a local dir or the Hugging Face cache, `local_files_only`;
+  cosyvoice: `COSYVOICE_MODEL_DIR`), and a missing one is not a unit (503 if
+  asked for). `python engines.py` prints the present engines as a JSON list
+  (reasons on stderr) in ~0.2 s without importing torch; a Harmony process node
+  runs it as its `units_probe` (livestack `node-py/docs/process-node-units-probe.md`)
+  so it never announces a unit that cannot load.
 - **Requires Python <3.13** (VoxCPM constraint). The MLX path is unaffected.
 
 ```bash
