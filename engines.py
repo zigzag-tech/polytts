@@ -103,6 +103,34 @@ def present_engines(engines: dict) -> tuple[dict, dict]:
     return {n: e for n, e in engines.items() if n not in missing}, missing
 
 
+def default_engines(models_dir: Path) -> dict:
+    """Every engine this server knows, unfiltered. server.py and the
+    `python engines.py` presence probe build the same set from here."""
+    return {"qwen": QwenEngine(models_dir), "voxcpm": VoxcpmEngine(),
+            "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()}
+
+
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt")
+
+
+def _hf_model_missing(model: str, label: str):
+    """Why `model` (a local directory or a Hugging Face repo id) cannot load
+    offline, or None. Resolves it the way voxcpm/dots_tts `from_pretrained`
+    do (a directory as is, otherwise `snapshot_download`), but with
+    local_files_only: no network, and nothing is downloaded. A snapshot with no
+    weight file is a partial download and counts as missing."""
+    if os.path.isdir(os.path.expanduser(model)):
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+        path = Path(snapshot_download(repo_id=model, local_files_only=True))
+    except Exception as e:  # LocalEntryNotFoundError, a bad repo id, no hub library
+        return f"{label} model {model} not in the local Hugging Face cache ({type(e).__name__})"
+    if not any(f.name.endswith(_WEIGHT_SUFFIXES) for f in path.rglob("*")):
+        return f"{label} model {model} has no weight file in {path}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Qwen3-TTS engine (pytorch)
 # ---------------------------------------------------------------------------
@@ -197,6 +225,9 @@ class VoxcpmEngine(Engine):
     def loaded(self) -> bool:
         return self._model is not None
 
+    def missing(self):
+        return _hf_model_missing(self.model_name, "VoxCPM")
+
     def load(self):
         from voxcpm import VoxCPM
         print(f"[voxcpm] loading {self.model_name} …", flush=True)
@@ -281,6 +312,9 @@ class DotsEngine(Engine):
     @property
     def loaded(self) -> bool:
         return self._rt is not None
+
+    def missing(self):
+        return _hf_model_missing(self.model_name, "dots.tts")
 
     def load(self):
         from dots_tts.runtime import DotsTtsRuntime
@@ -420,10 +454,19 @@ class CosyvoiceEngine(Engine):
         self.base_url = base_url
         self._loaded = False
         self.model_name = "Fun-CosyVoice3-0.5B"
+        # Where the sidecar loads from: the same env and defaults as
+        # cosyvoice_worker.py (which cannot be imported here: it imports torch).
+        repo = os.environ.get("COSYVOICE_REPO", "/home/ubuntu/CosyVoice")
+        self.model_dir = Path(os.environ.get(
+            "COSYVOICE_MODEL_DIR", f"{repo}/pretrained_models/Fun-CosyVoice3-0.5B"))
 
     @property
     def loaded(self) -> bool:
         return self._loaded
+
+    def missing(self):
+        # Only the model files: whether the sidecar is up is a runtime question.
+        return None if self.model_dir.is_dir() else f"CosyVoice model not found: {self.model_dir}"
 
     def load(self):
         try:
@@ -526,3 +569,17 @@ class ModelManager:
             "idle_for": round(time.monotonic() - self.last_used, 1) if self.resident else None,
             "engines": list(self.engines.keys()),
         }
+
+
+if __name__ == "__main__":
+    # Presence probe: print the engines that can load on this host as a JSON
+    # list, without starting the server or importing torch. A Harmony process
+    # node runs this before it announces (livestack `units_probe`) so it never
+    # offers a unit whose model files are absent. Why each other engine is
+    # missing goes to stderr. Same models dir as server.py's MODELS_DIR.
+    import json
+    import sys
+    present, missing = present_engines(default_engines(Path(__file__).resolve().parent / "models"))
+    for name, why in missing.items():
+        print(f"[polytts] engine {name} not offered: {why}", file=sys.stderr)
+    print(json.dumps(sorted(present)))

@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 import cache
 import pcm_cache
-from engines import QwenEngine, VoxcpmEngine, CosyvoiceEngine, DotsEngine, pcm16, present_engines
+from engines import default_engines, pcm16, present_engines
 
 RUNTIME = os.environ.get("POLYTTS_RUNTIME", "mlx").lower()
 
@@ -246,9 +246,7 @@ if _MANAGER_PATH:
     # An engine whose model files are absent is not a unit: advertising it let
     # the host broker evict a live model to warm a load certain to fail
     # (zz-whitby 2026-11-21, qwen with no models/ dir).
-    _ENGINES, _MISSING_ENGINES = present_engines(
-        {"qwen": QwenEngine(MODELS_DIR), "voxcpm": VoxcpmEngine(),
-         "cosyvoice": CosyvoiceEngine(), "dots": DotsEngine()})
+    _ENGINES, _MISSING_ENGINES = present_engines(default_engines(MODELS_DIR))
     for _name, _why in _MISSING_ENGINES.items():
         print(f"[polytts] engine {_name} not offered: {_why}", flush=True)
     _UNITS = {n: _engine_unit(n, e, n == DEFAULT_ENGINE) for n, e in _ENGINES.items()}
